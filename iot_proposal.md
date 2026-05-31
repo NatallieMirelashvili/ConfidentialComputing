@@ -312,32 +312,4 @@ These steps must be completed before any use case can be implemented or tested.
 
 ---
 
-### Use Case 5 — Protect sensitive metadata, not just footage
-
-**Goal:** Event metadata (motion detected, camera offline, storage full) is encrypted inside the Secure World so the server stores only ciphertext it cannot read.
-
-**Note:** This use case reuses the Telemetry TA from Use Case 1. The only difference is the data type being encrypted — instead of footage frames, you encrypt small structured event records. If Use Case 1 is implemented, Use Case 5 is mostly a demonstration exercise on top of existing code.
-
-**Step 1 — Define the telemetry event schema**
-- Create a simple C struct representing a camera event: `{ event_type, timestamp, camera_id, value }`
-- This is the plaintext that must never reach the server in readable form
-
-**Step 2 — Encrypt events in the Telemetry TA**
-- Reuse the `ENCRYPT_TELEMETRY` TA command from Use Case 1
-- Pass the serialised event struct as input; receive encrypted blob as output
-- Send the blob to IoT Hub as the message payload
-
-**Step 3 — Show the server-side database**
-- Query the IoT Hub message storage (or a connected Azure Storage account)
-- Show that all stored records are opaque blobs with no readable field values
-
-**Step 4 — Operator decrypts and displays**
-- The operator client receives the blob, decrypts it using their private key, deserialises the struct, and prints the event in human-readable form
-
-**Step 5 — Demonstrate the guarantee**
-- Side by side: the raw Azure Storage record (unreadable blob) vs the operator's terminal (plain event log)
-- This is a strong visual demo — the contrast makes the guarantee immediately obvious to an audience
-
----
-
 *Implementation steps appended for advisor review.*
