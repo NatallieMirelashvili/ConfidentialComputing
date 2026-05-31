@@ -113,18 +113,6 @@ The operator holds a private key that never leaves their machine. They use it to
 
 ---
 
-### Use Case 5 — Protect sensitive metadata, not just footage
-
-**Scenario:** A building's security team uses cameras, but even motion event logs are sensitive — knowing when a camera goes offline or detects no motion tells a physical attacker when to act.
-
-**What we protect against:** The cloud server operator inferring building occupancy patterns from metadata.
-
-**How:** Telemetry events (motion detected, camera offline, storage full) are encrypted inside the locked area to the operator's public key. The server stores and routes them but cannot read them.
-
-**What we demonstrate:** The server's database contains only ciphertext event records. The operator's dashboard decrypts and displays them correctly. A database administrator on the server side sees only opaque blobs.
-
----
-
 ## 5. Technical Approach
 
 | Component | Technology |
