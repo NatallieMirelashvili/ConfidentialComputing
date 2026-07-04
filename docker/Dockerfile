@@ -3,7 +3,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
-ENV PATH=/home/optee/.bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     adb \
@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc-arm-linux-gnueabi \
     gcc-arm-linux-gnueabihf \
     git \
+    gnupg \
     libattr1-dev \
     libcap-dev \
     libfdt-dev \
@@ -54,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     uuid-dev \
     vim-tiny \
+    wget \
     xxd \
     zlib1g-dev \
     && locale-gen C.UTF-8 \
@@ -63,12 +65,10 @@ RUN useradd -m -s /bin/bash optee \
     && mkdir -p /workspace \
     && chown -R optee:optee /workspace
 
+RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo \
+    && chmod a+x /usr/local/bin/repo
+
 USER optee
 WORKDIR /workspace/ConfidentialComputing
 
-RUN mkdir -p /home/optee/.bin \
-    && curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /home/optee/.bin/repo \
-    && chmod a+x /home/optee/.bin/repo
-
 CMD ["/bin/bash"]
-
