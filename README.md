@@ -1,82 +1,89 @@
-# ConfidentialComputing
-# Intel SGX Development: Core Concepts & Environment Setup
+# Confidential Computing OP-TEE/QEMU
 
-This guide explains the architecture, build process, and workflow for developing Intel SGX applications.
+This repository is a lean, Docker-only wrapper around the OP-TEE QEMU v8
+development environment used for the project. It does not vendor OP-TEE, Linux,
+QEMU, Buildroot, toolchains, or build outputs. Those are recreated from the
+pinned manifest in `manifests/locked-qemu_v8.xml`.
 
----
+The supported runtime target is a Linux x86_64 Docker host. The repository can
+be edited on macOS, but full OP-TEE/QEMU builds are not guaranteed on Docker
+Desktop for Mac.
 
-## 1. Core Architecture: The Enclave Model
+## Repository Layout
 
-Intel SGX partitions an application into two distinct parts:
+- `manifests/locked-qemu_v8.xml` - pinned OP-TEE manifest captured from `zeev`.
+- `project/optee_examples/` - project CA/TA source overlaid into OP-TEE.
+- `docker/Dockerfile` - Linux x86_64 build and QEMU runtime image.
+- `scripts/` - Docker, bootstrap, build, source sync, and QEMU run helpers.
+- `docs/` and project notes - design and course documentation.
 
-### **The Untrusted Part (App)**
-- **Role:** The standard application running in the normal OS environment.
-- **Responsibility:** Manages the enclave's lifecycle (creation, initialization, and destruction).
-- **File:** `App.cpp`.
+Generated OP-TEE content is created under `.optee-workspace/` and ignored by Git.
 
-### **The Trusted Part (Enclave)**
-- **Role:** A secure, hardware-encrypted memory region (EPC).
-- **Responsibility:** Executes sensitive logic and protects data from the OS, BIOS, and other applications.
-- **File:** `Enclave.cpp`.
+## Quick Start
 
-### **The Interface (EDL)**
-- **File:** `Enclave.edl` (Enclave Definition Language).
-- **Function:** Acts as the "contract" between the App and the Enclave.
-- **ECALL:** Functions defined in the `trusted` block; called by the App to enter the Enclave.
-- **OCALL:** Functions defined in the `untrusted` block; called by the Enclave to request services from the App (e.g., printing to screen).
+Build the Docker image:
 
-
-
----
-
-## 2. The Build Process
-
-Compiling an SGX application involves several specialized steps to ensure security:
-
-1.  **Edger8r Tool:** Parses the `.edl` file to generate "Proxy" and "Bridge" C code. These files handle the low-level transitions between secure and non-secure modes.
-2.  **Compilation:** The `Enclave.cpp` is compiled into a Shared Object (`.so`).
-3.  **Signing Tool:** The `.so` file is signed using a private key to produce `enclave.signed.so`. 
-    - **Note:** Only the `.signed.so` file can be loaded into a real enclave. The hardware verifies the signature before execution.
-
----
-
-## 3. Development Workflow
-
-### **Environment Initialization**
-In every new terminal session, you must load the SGX SDK environment variables:
 ```bash
-source /home/owner/natallie/confiden_comp/sgxsdk/environment
+scripts/docker-build.sh
 ```
 
-# Intel SGX Iterative Development Workflow
+Open a container shell:
 
-This document outlines the standard process for modifying, building, and testing an Intel SGX application. Follow these steps whenever you add new functionality, such as encryption logic or secure data processing.
-
----
-
-## The 5-Step Development Cycle
-
-When you need to add a new feature (e.g., Task 4: Adding Encryption), follow this specific sequence:
-
-### 1. Modify the Interface (`Enclave.edl`)
-You must first declare your new function so the App can "see" it inside the Enclave. 
-- Add your function prototype inside the `trusted { ... };` block.
-- **Example:** `public void ecall_encrypt_data([in, size=len] uint8_t* data, size_t len);`
-
-### 2. Implement Logic (`Enclave.cpp`)
-Write the actual C/C++ code that will execute inside the secure environment.
-- Implement the function you just declared in the `.edl` file.
-- Since this is inside the enclave, you can only use trusted libraries (e.g., `sgx_tcrypt` for encryption).
-
-### 3. Update the Host App (`App.cpp`)
-Trigger the secure logic from the untrusted world.
-- In your `main()` function or a helper function, call the ECALL using the generated proxy header.
-- **Note:** Remember to pass the `global_eid` as the first argument to every ECALL.
-
-### 4. Rebuild the Project
-Use the `make` command to re-compile both the App and the Enclave, and to re-sign the enclave binary.
 ```bash
-# We use Simulation Mode (SIM) if hardware SGX is not available
-make clean
-make SGX_MODE=SIM
+scripts/docker-shell.sh
 ```
+
+Inside the container, bootstrap OP-TEE from the pinned manifest:
+
+```bash
+scripts/bootstrap.sh
+```
+
+Build toolchains and the OP-TEE/QEMU images:
+
+```bash
+scripts/build.sh
+```
+
+Run QEMU with text consoles:
+
+```bash
+scripts/run-qemu.sh
+```
+
+`run-qemu.sh` starts a tmux session when needed. When QEMU starts, continue
+execution with `c`, log in to the Normal World console as `root`, then run:
+
+```bash
+optee_example_hello_world
+```
+
+## One-Step Container Build
+
+On a Linux x86_64 Docker host, this runs the Docker image build followed by
+OP-TEE bootstrap and build:
+
+```bash
+scripts/full-build-in-docker.sh
+```
+
+The full OP-TEE build downloads and compiles large upstream projects. Expect many
+gigabytes of generated data under `.optee-workspace/`.
+
+## Updating Project Source
+
+Edit files under `project/optee_examples/`. The helper scripts sync those files
+into `.optee-workspace/optee_examples/` before build and run.
+
+To resync manually inside the container:
+
+```bash
+scripts/sync-project.sh
+```
+
+## Notes
+
+- Do not commit `.optee-workspace/`, `out/`, `out-br/`, `toolchains/`, nested
+  upstream `.git/` directories, IDE state, logs, or generated binaries.
+- The original source checkout on `zeev` was used only as a read-only source for
+  the initial manifest and example code.
