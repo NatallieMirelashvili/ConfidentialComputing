@@ -58,6 +58,76 @@ execution with `c`, log in to the Normal World console as `root`, then run:
 optee_example_hello_world
 ```
 
+## Run On Zeev
+
+The prepared staging checkout on `zeev` is:
+
+```bash
+ssh zeev
+cd /home/owner/tomerlao/ConfidentialComputing
+```
+
+Build the Docker image if it is missing or if `docker/Dockerfile` changed:
+
+```bash
+./scripts/docker-build.sh
+```
+
+Open the Docker shell:
+
+```bash
+./scripts/docker-shell.sh
+```
+
+Inside the container, bootstrap once for a fresh checkout:
+
+```bash
+scripts/bootstrap.sh
+```
+
+Inside the container, compile the project and OP-TEE images:
+
+```bash
+scripts/build.sh
+```
+
+Start QEMU:
+
+```bash
+QEMU_NW_PORT=55320 QEMU_SW_PORT=55321 QEMU_TMUX_SESSION=optee-qemu scripts/run-qemu.sh
+```
+
+`run-qemu.sh` uses tmux. After QEMU starts, switch to the serial-console tmux
+window with:
+
+```text
+Ctrl-b
+1
+```
+
+The Normal World and Secure World consoles are in that tmux window. If execution
+is still stopped at the QEMU monitor in window `0`, switch back with `Ctrl-b`
+then `0`, type `c` and press Enter, then switch again with `Ctrl-b` then `1`.
+
+In the Normal World console, log in as:
+
+```text
+root
+```
+
+Run the program:
+
+```bash
+optee_example_hello_world
+```
+
+Expected output:
+
+```text
+Invoking TA to increment 42
+TA incremented value to 43
+```
+
 ## One-Step Container Build
 
 On a Linux x86_64 Docker host, this runs the Docker image build followed by
