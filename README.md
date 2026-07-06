@@ -15,6 +15,8 @@ Generated OP-TEE content is created under `.optee-workspace/` and ignored by Git
 
 ## Quick Start
 
+** This takes around 20GB of disk space, make sure that your machine is up to it. **
+
 Build the Docker image:
 
 This creates a reproducible Linux x86_64 environment with the cross-compilers,
@@ -48,36 +50,34 @@ The downloaded repositories and generated workspace files are placed under
 scripts/bootstrap.sh
 ```
 
-Build toolchains and the OP-TEE/QEMU images:
+Build toolchains, project code, and the OP-TEE/QEMU images:
 
 This compiles the cross-toolchains and then builds the full emulated platform
 that QEMU will boot. Conceptually, this creates both sides of the TEE system:
 Linux in the Normal World and OP-TEE in the Secure World.
 
 ```bash
-scripts/build.sh
+scripts/build-project.sh
 ```
 
-Run QEMU with text consoles:
+Run the project in QEMU with text consoles:
 
 This starts the virtual ARM machine that emulates the TrustZone hardware used by
 OP-TEE. QEMU lets us develop and test TEE code without needing a physical board.
+The helper opens the tmux session, continues QEMU from the monitor, switches to
+the console window, logs in to the Normal World as `root`, and runs the project
+edge-device client.
 
 ```bash
-scripts/run-qemu.sh
+scripts/run-project.sh
 ```
 
-`run-qemu.sh` starts a tmux session when needed. When QEMU starts, continue
-execution with `ctrl + b then 1`, log in to the Normal World console as `root`, then run
-the example client:
+The command it runs inside the Normal World console is:
 
 ```bash
-optee_example_hello_world
+optee_example_confidential_iot_edge
 ```
 
-The example proves that a Linux process in the Normal World can call into a
-Trusted Application running under OP-TEE in the Secure World and receive a
-response.
 
 ## Run On Zeev
 
@@ -111,60 +111,39 @@ bootable QEMU images. The output includes the Normal World Linux image and the
 Secure World OP-TEE binaries.
 
 ```bash
-scripts/build.sh
+scripts/build-project.sh
 ```
 
-Start QEMU:
+Start QEMU and run the project:
 
 This boots the compiled virtual TrustZone machine in QEMU and exposes its text
-consoles through tmux. The custom ports and session name avoid collisions with
-other users or runs on `zeev`.
+consoles through tmux. The helper continues QEMU, switches to the console
+window, logs in as `root`, and runs the project edge-device client. The custom
+session name avoids collisions with other users or runs on `zeev`.
 
 ```bash
-QEMU_NW_PORT=55320 QEMU_SW_PORT=55321 QEMU_TMUX_SESSION=optee-qemu scripts/run-qemu.sh
+QEMU_TMUX_SESSION=your-name-please-edit scripts/run-project.sh
 ```
 
-`run-qemu.sh` uses tmux. After QEMU starts, switch to the serial-console tmux
-window with:
+The Normal World and Secure World consoles are shown in the tmux console window.
+The helper waits for the `buildroot login:` prompt before typing `root`, then
+waits for the root shell prompt before running the project binary.
 
-This moves from the QEMU monitor window to the serial consoles where the guest
-systems print logs and accept input. In this setup, tmux keeps the emulator
-control channel and the emulated machine consoles in separate windows.
+The project edge-device program:
 
-```text
-Ctrl-b
-1
-```
-
-The Normal World and Secure World consoles are in that tmux window. If execution
-is still stopped at the QEMU monitor in window `0`, switch back with `Ctrl-b`
-then `0`, type `c` and press Enter, then switch again with `Ctrl-b` then `1`.
-
-In the Normal World console, log in as:
-
-The Normal World is the regular Linux environment running beside OP-TEE. Logging
-in as `root` gives you a shell where you can launch client applications that
-request services from Trusted Applications.
-
-```text
-root
-```
-
-Run the program:
-
-This starts the sample Normal World client, which sends a command through the
-TEE client API into the Secure World. A successful response shows that Linux,
-OP-TEE, and the Trusted Application can communicate correctly in QEMU.
+This starts the Normal World edge-device client, which runs the current project
+stub flow and sends sensor data through the TEE client API into the Secure
+World. A successful response shows that Linux, OP-TEE, and the project Trusted
+Application can communicate correctly in QEMU.
 
 ```bash
-optee_example_hello_world
+optee_example_confidential_iot_edge
 ```
 
 Expected output:
 
 ```text
-Invoking TA to increment 42
-TA incremented value to 43
+edge_device: completed stub flow
 ```
 
 ## Updating Project Source
@@ -186,5 +165,4 @@ scripts/sync-project.sh
 
 - Do not commit `.optee-workspace/`, `out/`, `out-br/`, `toolchains/`, nested
   upstream `.git/` directories, IDE state, logs, or generated binaries.
-- The original source checkout on `zeev` was used only as a read-only source for
-  the initial manifest and example code.
+
