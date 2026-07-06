@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #include "attestation.h"
 
 int create_attestation_report(char *out, size_t out_size)

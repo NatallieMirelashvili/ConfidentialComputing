@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #include "server.h"
 
 #include <stdio.h>

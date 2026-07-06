@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #ifndef ATTESTATION_H
 #define ATTESTATION_H
 

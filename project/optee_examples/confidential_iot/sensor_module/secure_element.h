@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #ifndef SECURE_ELEMENT_H
 #define SECURE_ELEMENT_H
 

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #ifndef CONFIDENTIAL_IOT_TA_H
 #define CONFIDENTIAL_IOT_TA_H
 

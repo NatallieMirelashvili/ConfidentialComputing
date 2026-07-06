@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #include "edge_device.h"
 
 #include <stdio.h>

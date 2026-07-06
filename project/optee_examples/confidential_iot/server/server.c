@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #include "server.h"
 
 int server_get_sensor_data(char *out, size_t out_size)

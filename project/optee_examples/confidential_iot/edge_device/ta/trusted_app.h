@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #ifndef TRUSTED_APP_H
 #define TRUSTED_APP_H
 

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #include "secure_element.h"
 
 size_t get_identity(char *out, size_t out_size)

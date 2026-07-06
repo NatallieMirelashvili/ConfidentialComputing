@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
 #ifndef EDGE_DEVICE_H
 #define EDGE_DEVICE_H
 
