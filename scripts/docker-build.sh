@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Description: Build the Docker image used for the OP-TEE development environment.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,4 +10,3 @@ docker build \
   -f "$ROOT_DIR/docker/Dockerfile" \
   -t "$IMAGE_NAME" \
   "$ROOT_DIR"
-

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Description: Sync project sources and build the OP-TEE workspace.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,4 +22,3 @@ if [[ -f "$OPTEE_WORKSPACE/toolchains/rust/.cargo/env" ]]; then
 fi
 
 make -j"$(nproc)"
-

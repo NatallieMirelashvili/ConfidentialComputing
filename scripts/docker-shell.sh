@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Description: Start an interactive shell inside the OP-TEE Docker build environment.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

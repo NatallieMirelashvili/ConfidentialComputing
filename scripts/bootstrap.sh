@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Description: Initialize and sync the pinned OP-TEE workspace used by this project.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
