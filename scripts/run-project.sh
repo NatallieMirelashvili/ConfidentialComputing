@@ -69,6 +69,28 @@ if [[ ! -d "$OPTEE_WORKSPACE/build" ]]; then
   exit 1
 fi
 
+# Persistent per-instance virtual disk so the fTPM's REE-FS secure storage
+# (/var/lib/tee, mounted by S29tee-storage before tee-supplicant starts)
+# survives a QEMU reboot and the device's Attestation Key doesn't have to be
+# re-provisioned/re-registered every run. See docs/HANDOFF_persistentAK.md.
+# Computed here (not in the QEMU_EXTRA_ARGS default above) so the path is
+# always correct for wherever QEMU actually runs: this script re-execs itself
+# inside Docker above, and $ROOT_DIR resolves to the container's bind-mounted
+# path in that case, the host path otherwise.
+DEVICE_STATE_DIR="${DEVICE_STATE_DIR:-$ROOT_DIR/.device-state}"
+DEVICE_DISK_IMG="${DEVICE_DISK_IMG:-$DEVICE_STATE_DIR/iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1))).img}"
+mkdir -p "$DEVICE_STATE_DIR"
+if [[ ! -f "$DEVICE_DISK_IMG" ]]; then
+  # Pre-format on the host (native x86_64 e2fsprogs, no cross-compilation
+  # needed) rather than in the guest: the Buildroot rootfs has no mkfs.ext4,
+  # and cross-building e2fsprogs pulls in a broken util-linux/util-linux-libs
+  # dependency split in this Buildroot snapshot. mkfs.ext4 can format a plain
+  # regular file directly, no loop device required.
+  truncate -s 64M "$DEVICE_DISK_IMG"
+  mkfs.ext4 -q -F "$DEVICE_DISK_IMG"
+fi
+QEMU_EXTRA_ARGS="$QEMU_EXTRA_ARGS -drive if=none,file=$DEVICE_DISK_IMG,format=raw,id=hd1 -device virtio-blk-device,drive=hd1"
+
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for the automated project run." >&2
   exit 1

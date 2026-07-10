@@ -26,3 +26,9 @@ install(TARGETS optee_example_confidential_iot_edge
 
 install(PROGRAMS scripts/provision-device.sh
 	DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Must run before /etc/init.d/S30optee (tee-supplicant) so OP-TEE's REE-FS
+# secure storage mounts onto the persistent disk first. See
+# scripts/S29tee-storage and docs/HANDOFF_persistentAK.md.
+install(PROGRAMS scripts/S29tee-storage
+	DESTINATION /etc/init.d)

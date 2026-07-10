@@ -9,8 +9,11 @@
 #
 # Prints the enrollment record (JSON) an admin must submit to the
 # management server's POST /api/devices/register before this device can
-# attest (see CC_Server/server/app_server.py). Idempotent: does nothing and
-# reprints the existing record if already provisioned.
+# attest (see CC_Server/server/app_server.py). Idempotent: gated on whether
+# the AK already exists at AK_HANDLE in the fTPM (not on /etc/confidential_iot,
+# which lives on the ephemeral initrd) - so on a build with the persistent
+# /var/lib/tee disk (see docs/HANDOFF_persistentAK.md), a reboot just
+# reprints the existing record instead of minting a new AK.
 #
 # NOTE: exact tpm2-tools flags below should be checked against
 # `tpm2_createek --help` / `tpm2_createak --help` / `tpm2_readpublic --help`
@@ -77,19 +80,23 @@ print_enrollment_record() {
 # the edge binary's later quote observe the same measured value.
 software_measure_pcr0
 
-if [ -f "$CONF_FILE" ]; then
-	echo "Already provisioned ($CONF_FILE exists). Enrollment record:" >&2
-	print_enrollment_record
-	exit 0
-fi
-
 mkdir -p "$CONF_DIR"
 cd "$CONF_DIR"
 
-tpm2_createek -c ek.ctx -G ecc -u ek.pub
-tpm2_createak -C ek.ctx -c ak.ctx -G ecc -g sha256 -s ecdsa -u ak.pub -n ak.name
-tpm2_evictcontrol -C o -c ak.ctx "$AK_HANDLE"
-tpm2_readpublic -c ak.ctx -f pem -o ak.pem
+# tpm2_readpublic only reads - it never creates state - so this is a safe,
+# side-effect-free probe for "does the AK already exist" (true on every boot
+# after the first, once /var/lib/tee is persisted; always false without it).
+if tpm2_readpublic -c "$AK_HANDLE" -f pem -o ak.pem 2>/dev/null; then
+	echo "AK already persisted at $AK_HANDLE (survived reboot). Enrollment record:" >&2
+else
+	tpm2_createek -c ek.ctx -G ecc -u ek.pub
+	tpm2_createak -C ek.ctx -c ak.ctx -G ecc -g sha256 -s ecdsa -u ak.pub -n ak.name
+	tpm2_evictcontrol -C o -c ak.ctx "$AK_HANDLE"
+	tpm2_readpublic -c ak.ctx -f pem -o ak.pem
+
+	echo "Provisioned. Submit this enrollment record to the management server" >&2
+	echo "(POST /api/devices/register) before running optee_example_confidential_iot_edge:" >&2
+fi
 
 cat > "$CONF_FILE" <<EOF
 device_id=$DEVICE_ID
@@ -98,6 +105,4 @@ server_port=$SERVER_PORT
 ak_handle=$AK_HANDLE
 EOF
 
-echo "Provisioned. Submit this enrollment record to the management server" >&2
-echo "(POST /api/devices/register) before running optee_example_confidential_iot_edge:" >&2
 print_enrollment_record
