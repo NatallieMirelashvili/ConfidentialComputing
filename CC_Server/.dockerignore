@@ -1,0 +1,10 @@
+# Keep the build context tiny: only the server/ package goes into the image.
+# Ignore everything, then allow server/, then re-exclude generated bits.
+*
+!server
+
+# Regenerated at runtime / not needed in the image.
+server/certs
+**/__pycache__
+**/*.pyc
+.venv

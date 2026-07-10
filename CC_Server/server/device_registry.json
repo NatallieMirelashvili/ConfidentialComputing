@@ -1,0 +1,23 @@
+{
+  "iot-edge-01": {
+    "device_id": "iot-edge-01",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEs0BZcQpTyCY1R0X9vKGYdiQWNOcw\nhkDMo/jpyaZtze/d86RSgS+k4m5bgmkaITIwwOJ0qiHPnsrInSLi6cidSw==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0x688882FEB0894B3A772F7501895F201D95668DB2DBC2F40F895E6B8ACBB500BA\n",
+    "pcr_bank": "sha256:0",
+    "created_at": 1783680069.645724
+  },
+  "iot-edge-02": {
+    "device_id": "iot-edge-02",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEa7EreLYAuxDPIoMg5ZqfT0iGRuJg\n6LFz5ZBDYLzEGmpqNrs7fS/LNLoD4w3DAxeS+cn5K+wFqnLacAG+XFbR1g==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0x688882FEB0894B3A772F7501895F201D95668DB2DBC2F40F895E6B8ACBB500BA\n",
+    "pcr_bank": "sha256:0",
+    "created_at": 1783680111.0616386
+  },
+  "iot-edge-03": {
+    "device_id": "iot-edge-03",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEocajCB/hgaDEo6AXYDr5HmrUxNRJ\nj2kTEXRZ4LLxZ5vd7j62Qx01485GUi2ND7GaWeyVsbHBSULDksu6m6zF8g==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0x0000000000000000000000000000000000000000000000000000000000000000\n",
+    "pcr_bank": "sha256:0",
+    "created_at": 1783620784.0300796
+  }
+}

@@ -13,6 +13,15 @@ fi
 
 "$ROOT_DIR/scripts/sync-project.sh"
 
+# Export tracked Buildroot package selections (BR2_* lines) so the OP-TEE
+# makefiles fold them into Buildroot's generated .config (see the comment in
+# project/buildroot/packages.conf for how this works).
+while IFS= read -r br2_line; do
+  case "$br2_line" in
+    BR2_*=*) export "${br2_line?}" ;;
+  esac
+done < "$ROOT_DIR/project/buildroot/packages.conf"
+
 cd "$OPTEE_WORKSPACE/build"
 make -f toolchain.mk toolchains
 

@@ -146,6 +146,24 @@ Expected output:
 edge_device: completed stub flow
 ```
 
+## Running Multiple Devices Concurrently
+
+Each `scripts/run-project.sh` invocation needs its own terminal (it attaches to its own tmux
+session) and a distinct `QEMU_INSTANCE` index, so the gdbstub/serial ports and the default
+`device_id` don't collide with other running instances:
+
+```bash
+# terminal 2
+QEMU_TMUX_SESSION=optee-qemu-1 QEMU_INSTANCE=0 scripts/run-project.sh
+# terminal 3
+QEMU_TMUX_SESSION=optee-qemu-2 QEMU_INSTANCE=1 scripts/run-project.sh
+```
+
+Each instance auto-provisions itself (`provision-device.sh`) with its derived `device_id` before
+running the edge binary — boot plus provisioning can take a couple of minutes, since the fTPM
+device needs time to settle. See `docs/ATTESTATION_TESTING.md` §5 for the full walkthrough,
+including starting the server and registering each device.
+
 ## Updating Project Source
 
 Edit files under `project/optee_examples/`. The helper scripts sync those files
