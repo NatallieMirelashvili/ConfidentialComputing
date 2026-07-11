@@ -11,7 +11,7 @@ the slow QEMU build.
 
 ```bash
 cd /home/Michael/ConfidentialComputing/CC_Server
-python3 -m pip install --user pytest fastapi httpx uvicorn cryptography
+python3 -m pip install --user pytest fastapi httpx uvicorn websockets cryptography
 python3 -m pytest server/tests -v
 ```
 

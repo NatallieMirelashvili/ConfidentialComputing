@@ -55,3 +55,5 @@ AGGREGATIONS = ("raw", "mean", "min", "max", "weighted_avg")
 DEFAULT_AGGREGATION = "weighted_avg"
 
 DEFAULT_DEVICE_ID = "iot-edge-01"        # used when a request omits device_id
+
+WS_COLLECT_POLL_SECONDS = 1.0            # /ws/collect: seconds between live pushes

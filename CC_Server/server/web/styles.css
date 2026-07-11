@@ -53,9 +53,20 @@ button {
 button:disabled { opacity: .5; cursor: default; }
 .status { color: var(--muted); font-size: .9rem; }
 
+.livebadge { font-size: .82rem; font-weight: 600; }
+.livebadge.live { color: var(--ok); }
+.livebadge.connecting { color: var(--muted); }
+.livebadge.offline { color: var(--bad); }
+.livebadge.error { color: var(--bad); }
+
+.card h2 .hint { font-size: .78rem; font-weight: 400; color: var(--muted); }
+
 .hidden { display: none; }
 
-.verdicts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.verdicts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.verdictNote { font-size: .82rem; margin-bottom: 14px; min-height: 1.2em; }
+.verdictNote.muted { color: var(--muted); }
+.verdictNote.bad { color: var(--bad); font-weight: 600; }
 .chip {
   padding: 5px 12px; border-radius: 999px; font-size: .82rem; font-weight: 600;
   border: 1px solid var(--border);

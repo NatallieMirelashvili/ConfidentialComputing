@@ -161,6 +161,10 @@ async function init() {
   });
 
   $("collect").addEventListener("click", onCollect);
+  $("device").addEventListener("change", applyLiveParams);
+  $("window").addEventListener("change", applyLiveParams);
+  $("aggregation").addEventListener("change", applyLiveParams);
+  openLiveSocket();
 }
 
 async function onCollect() {
@@ -196,6 +200,10 @@ function renderResult(r) {
     chip("integrity", r.integrity === "ok") +
     chip("measurement", !!r.measurement_ok);
 
+  const noteEl = $("verdictNote");
+  noteEl.textContent = r.note || "";
+  noteEl.className = "verdictNote " + (r.attested ? "muted" : "bad");
+
   const res = r.result || {};
   let html;
   if (res.kind === "raw") {
@@ -209,6 +217,88 @@ function renderResult(r) {
     html = `<div>${res.value}</div><small>${res.kind} over ${r.window} · ${r.n_samples} samples</small>`;
   }
   $("result").innerHTML = html;
+}
+
+// --- Live feed (WebSocket): repeats /api/collect on a timer over one socket -
+let liveSocket = null;
+let liveReconnectTimer = null;
+let liveReconnectDelayMs = 1000;
+const LIVE_RECONNECT_MAX_MS = 5000;
+
+function liveWsUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams({
+    device_id: $("device").value,
+    window: $("window").value,
+    aggregation: $("aggregation").value,
+  });
+  return `${proto}//${location.host}/ws/collect?${params.toString()}`;
+}
+
+function setLiveBadge(state) {
+  const el = $("livebadge");
+  if (!el) return;
+  el.className = "livebadge " + state;
+  el.textContent =
+    state === "live" ? "● live" :
+    state === "connecting" ? "● connecting…" :
+    state === "error" ? "● error (see status)" :
+    "● offline";
+}
+
+function openLiveSocket() {
+  if (liveReconnectTimer) {
+    clearTimeout(liveReconnectTimer);
+    liveReconnectTimer = null;
+  }
+  setLiveBadge("connecting");
+
+  const ws = new WebSocket(liveWsUrl());
+  liveSocket = ws;
+
+  ws.addEventListener("open", () => {
+    if (ws !== liveSocket) return;
+    liveReconnectDelayMs = 1000;
+    setLiveBadge("live");
+  });
+
+  ws.addEventListener("message", (ev) => {
+    if (ws !== liveSocket) return;
+    let r;
+    try {
+      r = JSON.parse(ev.data);
+    } catch (e) {
+      // Malformed frame (e.g. non-finite number from a bad sample) - the
+      // connection is still alive, just skip this tick rather than crash.
+      setLiveBadge("error");
+      $("status").textContent = "live feed: bad frame (" + e + ")";
+      return;
+    }
+    if (r.error) {
+      // Server kept the socket alive but this tick failed - not a
+      // disconnect, so don't claim "offline".
+      setLiveBadge("error");
+      $("status").textContent = "live feed: " + r.error;
+      return;
+    }
+    setLiveBadge("live");
+    renderResult(r);
+  });
+
+  ws.addEventListener("close", () => {
+    // A newer socket (param change) already superseded this one - nothing to do.
+    if (ws !== liveSocket) return;
+    setLiveBadge("offline");
+    liveReconnectTimer = setTimeout(openLiveSocket, liveReconnectDelayMs);
+    liveReconnectDelayMs = Math.min(liveReconnectDelayMs * 2, LIVE_RECONNECT_MAX_MS);
+  });
+
+  ws.addEventListener("error", () => ws.close());
+}
+
+function applyLiveParams() {
+  if (liveSocket) liveSocket.close();
+  openLiveSocket();
 }
 
 init().catch((e) => {

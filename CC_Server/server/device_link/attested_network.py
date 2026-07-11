@@ -67,60 +67,75 @@ class AttestedNetworkDeviceLink(DeviceLink):
     # -- per-connection protocol state machine ------------------------------
     def _handle_connection(self, readline, writeline) -> None:
         device_id: str | None = None
+        try:
+            while True:
+                line = readline()
+                if line is None:
+                    return
 
-        while True:
-            line = readline()
-            if line is None:
-                return
-
-            try:
-                msg = json.loads(line)
-            except (ValueError, TypeError):
-                writeline({"ok": False, "error": "invalid JSON"})
-                continue
-
-            msg_type = msg.get("type")
-
-            if msg_type == "hello":
-                device_id = str(msg.get("device_id") or "")
                 try:
-                    challenge = self._verifier.issue_challenge(device_id)
-                except AttestationError as exc:
-                    writeline({"type": "error", "error": str(exc)})
-                    device_id = None
+                    msg = json.loads(line)
+                except (ValueError, TypeError):
+                    writeline({"ok": False, "error": "invalid JSON"})
                     continue
-                challenge["type"] = "attest_challenge"
-                writeline(challenge)
 
-            elif msg_type == "attest_response":
-                if not device_id:
-                    writeline({"type": "attest_result", "ok": False,
-                               "error": "send hello first"})
-                    continue
-                try:
-                    self._verifier.verify_and_derive(
-                        device_id=device_id,
-                        device_ecdh_pub_b64=msg["device_ecdh_pub"],
-                        quote_b64=msg["quote"],
-                        signature_b64=msg["signature"],
-                        pcr_values_text=msg["pcr_values"],
-                    )
-                except (AttestationError, KeyError) as exc:
-                    writeline({"type": "attest_result", "ok": False,
-                               "error": str(exc)})
-                    continue
-                writeline({"type": "attest_result", "ok": True,
-                           "session_ttl": C.DEVICE_SESSION_TTL_SECONDS})
+                msg_type = msg.get("type")
 
-            elif msg_type == "data":
-                if not device_id:
-                    writeline({"ok": False, "error": "send hello first"})
-                    continue
-                self._on_data(device_id, msg)
-                writeline({"ok": True})
+                if msg_type == "hello":
+                    device_id = str(msg.get("device_id") or "")
+                    try:
+                        challenge = self._verifier.issue_challenge(device_id)
+                    except AttestationError as exc:
+                        writeline({"type": "error", "error": str(exc)})
+                        device_id = None
+                        continue
+                    challenge["type"] = "attest_challenge"
+                    writeline(challenge)
 
-            else:
-                writeline({"ok": False, "error": f"unknown type {msg_type!r}"})
+                elif msg_type == "attest_response":
+                    if not device_id:
+                        writeline({"type": "attest_result", "ok": False,
+                                   "error": "send hello first"})
+                        continue
+                    try:
+                        self._verifier.verify_and_derive(
+                            device_id=device_id,
+                            device_ecdh_pub_b64=msg["device_ecdh_pub"],
+                            quote_b64=msg["quote"],
+                            signature_b64=msg["signature"],
+                            pcr_values_text=msg["pcr_values"],
+                        )
+                    except (AttestationError, KeyError) as exc:
+                        writeline({"type": "attest_result", "ok": False,
+                                   "error": str(exc)})
+                        continue
+                    writeline({"type": "attest_result", "ok": True,
+                               "session_ttl": C.DEVICE_SESSION_TTL_SECONDS})
+
+                elif msg_type == "data":
+                    if not device_id:
+                        writeline({"ok": False, "error": "send hello first"})
+                        continue
+                    self._on_data(device_id, msg)
+                    writeline({"ok": True})
+
+                else:
+                    writeline({"ok": False, "error": f"unknown type {msg_type!r}"})
+        finally:
+            # However this connection ends (clean EOF, reset, or an
+            # unhandled exception - see _make_server's catch-all) the device
+            # is no longer live. Overwrite the cached verdict so the
+            # dashboard doesn't keep showing a stale "ok" for a device
+            # that's gone; a subsequent reconnect's own data naturally
+            # overwrites this again.
+            if device_id:
+                with self._lock:
+                    self._verdict[device_id] = {
+                        "attested": False,
+                        "integrity": "fail",
+                        "note": "device disconnected",
+                        "last_seen": time.time(),
+                    }
 
     def _on_data(self, device_id: str, msg: dict) -> None:
         now = time.time()

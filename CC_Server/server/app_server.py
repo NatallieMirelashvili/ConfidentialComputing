@@ -7,12 +7,13 @@ they receive/return plain JSON and never mention encryption.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -128,6 +129,47 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
         except ValueError as exc:
             # Bad window/aggregation -> 400 with a message the UI can show.
             return JSONResponse({"error": str(exc)}, status_code=400)
+
+    @app.websocket("/ws/collect")
+    async def collect_ws(websocket: WebSocket):
+        """Live feed: repeats POST /api/collect on a timer over one socket.
+
+        Params (query string, same names/defaults as /api/collect's body):
+        device_id, window, aggregation. Not covered by the AES-GCM app-layer
+        transport (that middleware only wraps ASGI "http" scopes) - fine here,
+        since this only ever carries the same non-secret trust/result data
+        /api/collect already returns in the clear over TLS.
+        """
+        await websocket.accept()
+        q = websocket.query_params
+        device_id = q.get("device_id") or C.DEFAULT_DEVICE_ID
+        window = q.get("window") or C.DEFAULT_WINDOW
+        aggregation = q.get("aggregation") or C.DEFAULT_AGGREGATION
+        try:
+            while True:
+                try:
+                    await websocket.send_json(
+                        await service.collect(device_id, window, aggregation)
+                    )
+                except ValueError as exc:
+                    # Bad window/aggregation -> tell the client, then stop.
+                    await websocket.send_json({"error": str(exc)})
+                    break
+                except Exception:
+                    # Anything else (e.g. a malformed sample from a real device)
+                    # must not silently kill the socket - that reads to the
+                    # browser as an unexpected disconnect ("offline") and it
+                    # keeps retrying into the same crash. Log it and tell the
+                    # client, but keep the loop (and the connection) alive so
+                    # the next tick can recover once the bad data has passed.
+                    _logger.exception(
+                        "collect_ws: collect() failed for device_id=%r window=%r "
+                        "aggregation=%r", device_id, window, aggregation,
+                    )
+                    await websocket.send_json({"error": "internal error, see server log"})
+                await asyncio.sleep(C.WS_COLLECT_POLL_SECONDS)
+        except WebSocketDisconnect:
+            pass
 
     # ---- let the transport mode wire itself in ---------------------------
     # TLS: no-op. AES-GCM: registers POST /api/handshake + the envelope

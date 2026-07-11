@@ -94,6 +94,26 @@ def test_e2e_tls_mode():
     assert r["n_samples"] > 0
 
 
+def test_ws_collect_live_feed():
+    """/ws/collect pushes a fresh collect result automatically, on a timer,
+    over one socket - same shape /api/collect returns, no client request needed
+    per frame."""
+    app, _ = create_app(C.USER_SECURITY_TLS)
+    client = TestClient(app)
+
+    with client.websocket_connect(
+        f"/ws/collect?device_id={C.DEFAULT_DEVICE_ID}&window=1h&aggregation=mean"
+    ) as ws:
+        first = ws.receive_json()
+        assert first["attested"] is True
+        assert first["integrity"] == "ok"
+        assert first["measurement_ok"] is True
+        assert first["result"]["kind"] == "mean"
+
+        second = ws.receive_json()  # proves the server loop ticks again on its own
+        assert second["device_id"] == C.DEFAULT_DEVICE_ID
+
+
 # --------------------------------------------------------------------------
 # E2E — AES-GCM app-layer mode (emulate the browser in Python)
 # --------------------------------------------------------------------------

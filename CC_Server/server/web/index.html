@@ -42,13 +42,15 @@
       <div class="row">
         <button id="collect">Collect</button>
         <span id="status" class="status"></span>
+        <span id="livebadge" class="livebadge connecting">● connecting…</span>
       </div>
     </section>
 
-    <section id="resultCard" class="card hidden">
-      <h2>Result</h2>
+    <section id="resultCard" class="card">
+      <h2>Result <small class="hint">(live)</small></h2>
       <div class="verdicts" id="verdicts"></div>
-      <div class="result" id="result"></div>
+      <div class="verdictNote" id="verdictNote"></div>
+      <div class="result" id="result"><div>—</div><small>waiting for live data…</small></div>
       <details>
         <summary>Raw response</summary>
         <pre id="raw"></pre>

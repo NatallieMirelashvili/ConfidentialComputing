@@ -256,6 +256,12 @@ def test_attested_network_link_full_protocol(tmp_path):
                 "nonce": crypto.b64e(data_nonce),
                 "ciphertext": crypto.b64e(ct),
             })
+        # Called again right after the data message was processed -> the
+        # connection is still open at this point, so the verdict must
+        # already reflect a live, attested, integrity-ok session before we
+        # simulate the disconnect below.
+        assert link._verdict[fx.device_id]["attested"] is True
+        assert link._verdict[fx.device_id]["integrity"] == "ok"
         return None  # simulated disconnect
 
     def writeline(obj):
@@ -270,9 +276,12 @@ def test_attested_network_link_full_protocol(tmp_path):
     }
     assert outgoing[2] == {"ok": True}
 
+    # Once the connection has ended, the cached verdict must reflect that -
+    # not keep reporting a stale "attested/ok" for a device that's now gone
+    # (the sample it sent while still connected is still delivered, though).
     batch = asyncio.run(link.collect(fx.device_id, "1h"))
-    assert batch.attested is True
-    assert batch.integrity == "ok"
+    assert batch.attested is False
+    assert batch.note == "device disconnected"
     assert len(batch.samples) == 1
     assert batch.samples[0].value == 42.0
 
