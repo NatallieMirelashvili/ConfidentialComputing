@@ -6,14 +6,18 @@
 #
 # Run this once, from the Normal World shell, after first boot:
 #   provision-device.sh [device_id] [server_host] [server_port]
+# ADMIN_PORT (env, default 8000) is written to device.conf as admin_port -
+# the management server's admin API port, used by edge_device.c to
+# self-register (distinct from server_port, the device-facing port).
 #
-# Prints the enrollment record (JSON) an admin must submit to the
-# management server's POST /api/devices/register before this device can
-# attest (see CC_Server/server/app_server.py). Idempotent: gated on whether
-# the AK already exists at AK_HANDLE in the fTPM (not on /etc/confidential_iot,
-# which lives on the ephemeral initrd) - so on a build with the persistent
-# /var/lib/tee disk (see docs/HANDOFF_persistentAK.md), a reboot just
-# reprints the existing record instead of minting a new AK.
+# Prints the enrollment record (JSON) and saves it to
+# $CONF_DIR/enrollment.json, which edge_device.c submits itself to
+# POST /api/devices/register (see CC_Server/server/app_server.py) - no human
+# step required. Idempotent: gated on whether the AK already exists at
+# AK_HANDLE in the fTPM (not on /etc/confidential_iot, which lives on the
+# ephemeral initrd) - so on a build with the persistent /var/lib/tee disk
+# (see docs/HANDOFF_persistentAK.md), a reboot just reprints the existing
+# record instead of minting a new AK.
 #
 # NOTE: exact tpm2-tools flags below should be checked against
 # `tpm2_createek --help` / `tpm2_createak --help` / `tpm2_readpublic --help`
@@ -66,13 +70,20 @@ software_measure_pcr0() {
 	done
 }
 
+# Prints the enrollment record and also saves it to $CONF_DIR/enrollment.json
+# so edge_device.c (Host CA) can self-register it via
+# POST /api/devices/register without a human re-deriving it (see
+# edge_register_with_server() in edge_device.c).
 print_enrollment_record() {
 	ak_pub_b64=$(base64 -w0 "$CONF_DIR/ak.pem")
 	pcr_text=$(tpm2_pcrread sha256:0 2>&1)
 	pcr_json=$(printf '%s' "$pcr_text" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}')
 
-	printf '{"device_id":"%s","ak_pub_pem_b64":"%s","expected_pcr":"%s","pcr_bank":"sha256:0"}\n' \
-		"$DEVICE_ID" "$ak_pub_b64" "$pcr_json"
+	record=$(printf '{"device_id":"%s","ak_pub_pem_b64":"%s","expected_pcr":"%s","pcr_bank":"sha256:0"}' \
+		"$DEVICE_ID" "$ak_pub_b64" "$pcr_json")
+
+	printf '%s\n' "$record"
+	printf '%s' "$record" > "$CONF_DIR/enrollment.json"
 }
 
 # Extend PCR0 before any baseline read or quote, on every invocation (guarded to
@@ -103,6 +114,7 @@ device_id=$DEVICE_ID
 server_host=$SERVER_HOST
 server_port=$SERVER_PORT
 ak_handle=$AK_HANDLE
+admin_port=${ADMIN_PORT:-8000}
 EOF
 
 print_enrollment_record

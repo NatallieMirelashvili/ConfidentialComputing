@@ -21,14 +21,23 @@ fi
 
 "$ROOT_DIR/scripts/sync-project.sh"
 
+# libcurl is force-cleaned too: it can already be cached from an earlier
+# bootstrap as a transitive dependency of tpm2-tools/opensc (built with
+# whatever BR2_PACKAGE_LIBCURL_* suboptions were in effect back then).
+# Buildroot's per-package system only checks .stamp_* files, not whether a
+# package's Kconfig suboptions changed - so enabling BR2_PACKAGE_LIBCURL_CURL
+# / _MBEDTLS in project/buildroot/packages.conf silently has no effect on an
+# already-built libcurl until it's force-rebuilt like this.
 rm -rf \
   "$OPTEE_WORKSPACE/optee_ftpm/out" \
   "$OPTEE_WORKSPACE/trusted-firmware-a/build" \
   "$OPTEE_WORKSPACE/out-br/build/optee_client_ext-1.0" \
   "$OPTEE_WORKSPACE/out-br/build/optee_os_ext-1.0" \
   "$OPTEE_WORKSPACE/out-br/build/optee_examples_ext-1.0" \
+  $OPTEE_WORKSPACE/out-br/build/libcurl-* \
   "$OPTEE_WORKSPACE/out-br/per-package/optee_client_ext" \
   "$OPTEE_WORKSPACE/out-br/per-package/optee_os_ext" \
-  "$OPTEE_WORKSPACE/out-br/per-package/optee_examples_ext"
+  "$OPTEE_WORKSPACE/out-br/per-package/optee_examples_ext" \
+  "$OPTEE_WORKSPACE/out-br/per-package/libcurl"
 
 exec "$ROOT_DIR/scripts/build.sh"

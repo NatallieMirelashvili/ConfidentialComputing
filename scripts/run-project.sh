@@ -22,6 +22,10 @@ QEMU_GDB_PORT="${QEMU_GDB_PORT:-$(( 1234 + QEMU_PORT_OFFSET ))}"
 DEVICE_ID="${DEVICE_ID:-iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1)))}"
 SERVER_HOST="${SERVER_HOST:-10.0.2.2}"
 SERVER_PORT="${SERVER_PORT:-9100}"
+# Management server's admin API port (POST /api/devices/register), for the
+# device's own self-registration (see edge_device.c's edge_register_with_server()) -
+# distinct from SERVER_PORT above, the device-facing attestation port.
+API_PORT="${API_PORT:-8000}"
 PROJECT_PROVISION_SCRIPT="${PROJECT_PROVISION_SCRIPT:-provision-device.sh}"
 QEMU_PROVISION_TIMEOUT="${QEMU_PROVISION_TIMEOUT:-120}"
 # Attach a virtio NIC with QEMU user-mode (SLIRP) networking so the guest can
@@ -51,6 +55,7 @@ if [[ -z "${IN_OPTEE_DOCKER:-}" && -z "${SKIP_DOCKER:-}" && -f "$ROOT_DIR/docker
     -e DEVICE_ID="$DEVICE_ID"
     -e SERVER_HOST="$SERVER_HOST"
     -e SERVER_PORT="$SERVER_PORT"
+    -e API_PORT="$API_PORT"
     -e PROJECT_PROVISION_SCRIPT="$PROJECT_PROVISION_SCRIPT"
     -e QEMU_PROVISION_TIMEOUT="$QEMU_PROVISION_TIMEOUT"
     -v "$ROOT_DIR:/workspace/ConfidentialComputing"
@@ -160,7 +165,7 @@ tmux new-session -d -s "$QEMU_TMUX_SESSION" -n qemu \
   # so a failed attempt leaves no partial /etc/confidential_iot state) until
   # it succeeds or the budget below runs out.
   tmux send-keys -t "$QEMU_TMUX_SESSION:1.0" \
-    "i=0; rc=1; while [ \$i -lt 90 ]; do $PROJECT_PROVISION_SCRIPT '$DEVICE_ID' '$SERVER_HOST' '$SERVER_PORT'; rc=\$?; [ \$rc -eq 0 ] && break; i=\$((i+5)); sleep 5; done; echo CIOT_PROVISION_DONE=\$rc" C-m 2>/dev/null || true
+    "i=0; rc=1; while [ \$i -lt 90 ]; do ADMIN_PORT='$API_PORT' $PROJECT_PROVISION_SCRIPT '$DEVICE_ID' '$SERVER_HOST' '$SERVER_PORT'; rc=\$?; [ \$rc -eq 0 ] && break; i=\$((i+5)); sleep 5; done; echo CIOT_PROVISION_DONE=\$rc" C-m 2>/dev/null || true
 
   if ! wait_for_pane_text "$QEMU_TMUX_SESSION:1.0" "CIOT_PROVISION_DONE=" "$QEMU_PROVISION_TIMEOUT"; then
     tmux display-message -t "$QEMU_TMUX_SESSION" \

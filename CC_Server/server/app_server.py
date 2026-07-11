@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 
 from fastapi import FastAPI, Request
@@ -16,11 +17,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import constants as C
-from .device_registry import get_device_registry
+from .device_registry import DeviceKeyMismatch, get_device_registry
 from .service import CollectionService
 from .transport import UserChannel, get_user_channel
 
 _WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
+_logger = logging.getLogger(__name__)
 
 
 def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
@@ -70,11 +72,19 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
 
     @app.post("/api/devices/register")
     async def register_device(request: Request):
-        """Admin-only device enrollment: submit a device's attestation
-        identity (produced once by scripts/provision-device.sh) so it's
-        allowed to complete remote attestation. Gated behind this same
-        authenticated channel (TLS or AES-GCM) - never exposed on the
-        device-facing TCP port, which has no admin authentication.
+        """Device enrollment: submit a device's attestation identity
+        (produced once by scripts/provision-device.sh) so it's allowed to
+        complete remote attestation. Gated behind this same authenticated
+        channel (TLS or AES-GCM) - never exposed on the device-facing TCP
+        port, which has no authentication at all.
+
+        Self-service and idempotent, not admin-gated: an unseen device_id is
+        enrolled; a resubmission with the same key is a no-op ("already
+        registered"); a resubmission with a *different* key is rejected
+        rather than silently replacing the trusted identity (see
+        docs/HANDOFF_MISSIONS.md §2.2.b). Authorization beyond the transport
+        channel is intentionally out of scope - the registry file itself is
+        the protection boundary (chmod 0600, see device_registry.py).
 
         Body: {device_id, ak_pub_pem_b64, expected_pcr, pcr_bank?}
         """
@@ -90,10 +100,20 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
         if not device_id:
             return JSONResponse({"error": "device_id required"}, status_code=400)
 
-        record = get_device_registry().register(
-            device_id, ak_pub_pem, expected_pcr, pcr_bank
-        )
-        return {"ok": True, "device_id": record.device_id, "created_at": record.created_at}
+        try:
+            record, newly = get_device_registry().register(
+                device_id, ak_pub_pem, expected_pcr, pcr_bank
+            )
+        except DeviceKeyMismatch as exc:
+            _logger.warning("rejected registration for %s: %s", device_id, exc)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+
+        return {
+            "ok": True,
+            "device_id": record.device_id,
+            "created_at": record.created_at,
+            "already_registered": not newly,
+        }
 
     @app.post("/api/collect")
     async def collect(request: Request):

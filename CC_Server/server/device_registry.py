@@ -1,4 +1,4 @@
-"""Device registry — admin-enrolled device identities for attestation.
+"""Device registry — enrolled device identities for attestation.
 
 A device must be enrolled here (via `POST /api/devices/register`, gated
 behind the existing authenticated User<->Server channel — never the open
@@ -7,9 +7,15 @@ the piece the codebase's own docs flagged as an explicit gap: previously
 `NetworkDeviceLink` accepted any `device_id` a connecting socket claimed to
 be, with no identity check at all.
 
+Enrollment is self-service and idempotent (a device can register itself):
+an unseen device_id is added; a resubmission with the same key is a no-op;
+a resubmission with a different key is rejected rather than silently
+overwriting the trusted identity (see docs/HANDOFF_MISSIONS.md §2.2.b).
+
 Storage is a single JSON file (course-project scope; a real deployment would
-use a proper datastore) written atomically (write-to-temp + os.replace) so a
-crash mid-write can't corrupt it.
+use a proper datastore), written atomically (write-to-temp + os.replace) and
+chmod'd owner-only (0600) so it's readable/writable only by the OS user the
+server runs as - the entire protection model for this registry.
 """
 
 from __future__ import annotations
@@ -21,6 +27,18 @@ from dataclasses import asdict, dataclass
 from threading import Lock
 
 from .config import CONFIG
+
+
+class DeviceKeyMismatch(Exception):
+    """Raised by register() when device_id is already enrolled with a
+    different ak_pub_pem — refuses to silently replace a trusted identity.
+    See docs/HANDOFF_MISSIONS.md §2.2.b."""
+
+    def __init__(self, device_id: str) -> None:
+        super().__init__(
+            f"device {device_id!r} is already registered with a different key"
+        )
+        self.device_id = device_id
 
 
 @dataclass
@@ -68,13 +86,32 @@ class DeviceRegistry:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({k: v.to_dict() for k, v in self._records.items()}, f, indent=2)
         os.replace(tmp, self._path)
+        # os.replace() swaps in a fresh inode, so the mode has to be
+        # re-applied every save, not just once at file creation. This file is
+        # the device<->key trust mapping ("the admin has a saved file of a
+        # key") - owner-only access is the entire protection model: whoever
+        # can read/write it (i.e. is or sudos to the server's OS user) is the
+        # admin, no separate auth layer needed.
+        os.chmod(self._path, 0o600)
 
     def register(
         self, device_id: str, ak_pub_pem: str, expected_pcr: str, pcr_bank: str
-    ) -> DeviceRecord:
-        """Enroll (or re-enroll) a device. Overwrites any existing record for
-        the same device_id — re-running provisioning replaces the old identity."""
+    ) -> tuple[DeviceRecord, bool]:
+        """Enroll a device, idempotently.
+
+        Returns (record, newly_registered). An unseen device_id is enrolled.
+        A device_id that's already enrolled with the *same* ak_pub_pem is a
+        no-op (nothing to overwrite). A device_id already enrolled with a
+        *different* ak_pub_pem raises DeviceKeyMismatch instead of silently
+        replacing the trusted identity — see docs/HANDOFF_MISSIONS.md §2.2.b.
+        """
         with self._lock:
+            existing = self._records.get(device_id)
+            if existing is not None:
+                if existing.ak_pub_pem == ak_pub_pem:
+                    return existing, False
+                raise DeviceKeyMismatch(device_id)
+
             record = DeviceRecord(
                 device_id=device_id,
                 ak_pub_pem=ak_pub_pem,
@@ -84,7 +121,7 @@ class DeviceRegistry:
             )
             self._records[device_id] = record
             self._save()
-            return record
+            return record, True
 
     def lookup(self, device_id: str) -> DeviceRecord | None:
         with self._lock:

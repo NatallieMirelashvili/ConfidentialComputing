@@ -27,6 +27,9 @@ static char g_device_id[64] = "iot-edge-01";
 static char g_server_host[64] = "127.0.0.1";
 static uint16_t g_server_port = 9000;
 static char g_ak_handle[32] = "0x8101000A";
+/* Management-server admin API port (POST /api/devices/register), distinct
+ * from g_server_port (the device-facing attestation port). Same host. */
+static uint16_t g_admin_port = 8000;
 
 /* Attestation-session state, valid between edge_attest_to_server() and the
  * subsequent edge_handshake() / edge_send_sensor_data_to_server() calls. */
@@ -78,6 +81,8 @@ static void load_config(void)
 				g_server_port = (uint16_t)atoi(eq + 1);
 			else if (strcmp(line, "ak_handle") == 0)
 				snprintf(g_ak_handle, sizeof(g_ak_handle), "%s", eq + 1);
+			else if (strcmp(line, "admin_port") == 0)
+				g_admin_port = (uint16_t)atoi(eq + 1);
 		}
 		fclose(f);
 	}
@@ -94,6 +99,9 @@ static void load_config(void)
 	env = getenv("CIOT_AK_HANDLE");
 	if (env)
 		snprintf(g_ak_handle, sizeof(g_ak_handle), "%s", env);
+	env = getenv("CIOT_ADMIN_PORT");
+	if (env)
+		g_admin_port = (uint16_t)atoi(env);
 }
 
 int edge_device_init(void)
@@ -368,6 +376,19 @@ int edge_attest_to_server(void)
 	if (!msg)
 		return -1;
 
+	/* The server answers an unenrolled device_id with {"type":"error",...}
+	 * instead of a challenge. Distinguish "not registered" (retryable via
+	 * self-registration) from any other failure. */
+	item = cJSON_GetObjectItemCaseSensitive(msg, "type");
+	if (cJSON_IsString(item) && strcmp(item->valuestring, "error") == 0) {
+		const cJSON *err = cJSON_GetObjectItemCaseSensitive(msg, "error");
+		int not_registered = cJSON_IsString(err) &&
+			strstr(err->valuestring, "not registered") != NULL;
+
+		cJSON_Delete(msg);
+		return not_registered ? -2 : -1;
+	}
+
 	item = cJSON_GetObjectItemCaseSensitive(msg, "nonce");
 	if (!cJSON_IsString(item) ||
 	    mbedtls_base64_decode(g_nonce, sizeof(g_nonce), &g_nonce_len,
@@ -436,6 +457,67 @@ int edge_attest_to_server(void)
 	return 0;
 }
 
+#define CIOT_ENROLLMENT_PATH "/etc/confidential_iot/enrollment.json"
+#define CIOT_REGISTER_RESP_PATH "/tmp/ciot_register_resp.json"
+
+/* POST the enrollment record (written by provision-device.sh - device_id +
+ * AK pubkey + PCR baseline) to the management server's admin API, so a
+ * never-registered device enrolls itself with no human/register-device.sh
+ * step. Shells out to curl via system() rather than linking an HTTP/TLS
+ * library into the Host CA - BusyBox's wget has no HTTPS support in this
+ * rootfs, and the server's TLS transport is pinned to TLS 1.3 only, so a
+ * real TLS client is required (see project/buildroot/packages.conf). */
+static int edge_register_with_server(void)
+{
+	char cmd[512];
+	char resp[512] = { 0 };
+	FILE *f;
+	size_t len;
+	cJSON *msg;
+
+	snprintf(cmd, sizeof(cmd),
+		 "curl -sk -X POST --data-binary @%s -o %s "
+		 "https://%s:%u/api/devices/register",
+		 CIOT_ENROLLMENT_PATH, CIOT_REGISTER_RESP_PATH, g_server_host,
+		 g_admin_port);
+
+	if (system(cmd) != 0) {
+		fprintf(stderr, "edge_device: registration request failed (curl)\n");
+		return -1;
+	}
+
+	f = fopen(CIOT_REGISTER_RESP_PATH, "r");
+	if (!f) {
+		fprintf(stderr, "edge_device: no registration response\n");
+		return -1;
+	}
+	len = fread(resp, 1, sizeof(resp) - 1, f);
+	fclose(f);
+	resp[len] = '\0';
+
+	msg = cJSON_Parse(resp);
+	if (!msg) {
+		fprintf(stderr, "edge_device: unparseable registration response\n");
+		return -1;
+	}
+
+	if (!cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(msg, "ok"))) {
+		const cJSON *err = cJSON_GetObjectItemCaseSensitive(msg, "error");
+
+		fprintf(stderr,
+			"edge_device: registration rejected: %s (admin must resolve manually)\n",
+			cJSON_IsString(err) ? err->valuestring : "unknown error");
+		cJSON_Delete(msg);
+		return -1;
+	}
+
+	printf(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(msg, "already_registered")) ?
+	       "edge_device: already registered\n" :
+	       "edge_device: registered with the management server\n");
+	cJSON_Delete(msg);
+	return 0;
+}
+
 int edge_process_sensor_data(void)
 {
 #ifndef CONFIDENTIAL_IOT_NATIVE
@@ -463,13 +545,26 @@ int edge_process_sensor_data(void)
 
 int edge_ensure_session(void)
 {
+	int rc;
+
 	/* Still-valid session: nothing to do (attestation happens only when
 	 * needed, not on every push/collect). */
 	if (g_attested && mono_now() < g_session_expiry)
 		return 0;
 
-	if (edge_attest_to_server() != 0)
+	rc = edge_attest_to_server();
+	if (rc == -2) {
+		fprintf(stderr,
+			"edge_device: not registered, attempting self-registration...\n");
+		if (edge_register_with_server() != 0)
+			return -1;
+		/* Same connection, repeat "hello" - already how device-driven
+		 * re-attestation works (see edge_attest_to_server()). */
+		rc = edge_attest_to_server();
+	}
+	if (rc != 0)
 		return -1;
+
 	if (edge_handshake() != 0)
 		return -1;
 	return 0;
