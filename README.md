@@ -1,82 +1,186 @@
-# ConfidentialComputing
-# Intel SGX Development: Core Concepts & Environment Setup
+# Confidential Computing OP-TEE/QEMU
 
-This guide explains the architecture, build process, and workflow for developing Intel SGX applications.
+The supported runtime target is a Linux x86_64 Docker host only.
 
----
+## Repository Layout
 
-## 1. Core Architecture: The Enclave Model
+- `manifests/locked-qemu_v8.xml` - pinned OP-TEE manifest.
+- `project/optee_examples/` - project CA/TA source overlaid into OP-TEE.
+- `docker/Dockerfile` - Linux x86_64 build and QEMU runtime image.
+- `scripts/` - Docker, bootstrap, build, source sync, and QEMU run helpers.
+- `docs/` and project notes - design and course documentation. This should be
+  updated from time to time.
 
-Intel SGX partitions an application into two distinct parts:
+Generated OP-TEE content is created under `.optee-workspace/` and ignored by Git.
 
-### **The Untrusted Part (App)**
-- **Role:** The standard application running in the normal OS environment.
-- **Responsibility:** Manages the enclave's lifecycle (creation, initialization, and destruction).
-- **File:** `App.cpp`.
+## Quick Start
 
-### **The Trusted Part (Enclave)**
-- **Role:** A secure, hardware-encrypted memory region (EPC).
-- **Responsibility:** Executes sensitive logic and protects data from the OS, BIOS, and other applications.
-- **File:** `Enclave.cpp`.
+** This takes around 20GB of disk space, make sure that your machine is up to it. **
 
-### **The Interface (EDL)**
-- **File:** `Enclave.edl` (Enclave Definition Language).
-- **Function:** Acts as the "contract" between the App and the Enclave.
-- **ECALL:** Functions defined in the `trusted` block; called by the App to enter the Enclave.
-- **OCALL:** Functions defined in the `untrusted` block; called by the Enclave to request services from the App (e.g., printing to screen).
+Build the Docker image:
 
+This creates a reproducible Linux x86_64 environment with the cross-compilers,
+OP-TEE dependencies, and QEMU tools needed to build and emulate an ARM
+TrustZone system.
 
-
----
-
-## 2. The Build Process
-
-Compiling an SGX application involves several specialized steps to ensure security:
-
-1.  **Edger8r Tool:** Parses the `.edl` file to generate "Proxy" and "Bridge" C code. These files handle the low-level transitions between secure and non-secure modes.
-2.  **Compilation:** The `Enclave.cpp` is compiled into a Shared Object (`.so`).
-3.  **Signing Tool:** The `.so` file is signed using a private key to produce `enclave.signed.so`. 
-    - **Note:** Only the `.signed.so` file can be loaded into a real enclave. The hardware verifies the signature before execution.
-
----
-
-## 3. Development Workflow
-
-### **Environment Initialization**
-In every new terminal session, you must load the SGX SDK environment variables:
 ```bash
-source /home/owner/natallie/confiden_comp/sgxsdk/environment
+scripts/docker-build.sh
 ```
 
-# Intel SGX Iterative Development Workflow
+Open a container shell:
 
-This document outlines the standard process for modifying, building, and testing an Intel SGX application. Follow these steps whenever you add new functionality, such as encryption logic or secure data processing.
+This puts you inside the prepared build environment so host-machine differences
+do not affect the OP-TEE build. From here on, the commands run against the same
+toolchain and paths that everyone else on the project uses.
 
----
-
-## The 5-Step Development Cycle
-
-When you need to add a new feature (e.g., Task 4: Adding Encryption), follow this specific sequence:
-
-### 1. Modify the Interface (`Enclave.edl`)
-You must first declare your new function so the App can "see" it inside the Enclave. 
-- Add your function prototype inside the `trusted { ... };` block.
-- **Example:** `public void ecall_encrypt_data([in, size=len] uint8_t* data, size_t len);`
-
-### 2. Implement Logic (`Enclave.cpp`)
-Write the actual C/C++ code that will execute inside the secure environment.
-- Implement the function you just declared in the `.edl` file.
-- Since this is inside the enclave, you can only use trusted libraries (e.g., `sgx_tcrypt` for encryption).
-
-### 3. Update the Host App (`App.cpp`)
-Trigger the secure logic from the untrusted world.
-- In your `main()` function or a helper function, call the ECALL using the generated proxy header.
-- **Note:** Remember to pass the `global_eid` as the first argument to every ECALL.
-
-### 4. Rebuild the Project
-Use the `make` command to re-compile both the App and the Enclave, and to re-sign the enclave binary.
 ```bash
-# We use Simulation Mode (SIM) if hardware SGX is not available
-make clean
-make SGX_MODE=SIM
+scripts/docker-shell.sh
 ```
+
+Inside the container, bootstrap OP-TEE from the pinned manifest:
+
+This downloads the exact upstream OP-TEE components recorded for the project:
+the Normal World Linux side, the Secure World OP-TEE OS side, firmware, boot
+pieces, and examples. The pinned manifest keeps the emulator stack stable across
+machines and over time.
+The downloaded repositories and generated workspace files are placed under
+`.optee-workspace/`, outside the source tree that should be committed.
+
+```bash
+scripts/bootstrap.sh
+```
+
+Build toolchains, project code, and the OP-TEE/QEMU images:
+
+This compiles the cross-toolchains and then builds the full emulated platform
+that QEMU will boot. Conceptually, this creates both sides of the TEE system:
+Linux in the Normal World and OP-TEE in the Secure World.
+
+```bash
+scripts/build-project.sh
+```
+
+Run the project in QEMU with text consoles:
+
+This starts the virtual ARM machine that emulates the TrustZone hardware used by
+OP-TEE. QEMU lets us develop and test TEE code without needing a physical board.
+The helper opens the tmux session, continues QEMU from the monitor, switches to
+the console window, logs in to the Normal World as `root`, and runs the project
+edge-device client.
+
+```bash
+scripts/run-project.sh
+```
+
+The command it runs inside the Normal World console is:
+
+```bash
+optee_example_confidential_iot_edge
+```
+
+
+## Run On Zeev
+
+The Docker image is already present on zeev. Rebuild it with a different tag only if it changes.
+
+Open the Docker shell:
+
+This attaches to the existing OP-TEE Docker environment on `zeev` instead of
+building directly on the host. Use it so the build runs with the expected
+toolchain and filesystem layout.
+
+```bash
+./scripts/docker-shell.sh
+```
+
+Inside the container, bootstrap once for a fresh checkout:
+
+This creates `.optee-workspace/` and syncs the pinned OP-TEE source tree. You
+only need it when the workspace is missing or intentionally reset.
+It downloads the upstream OP-TEE repositories, firmware, Linux/QEMU build
+inputs, and examples into `.optee-workspace/` so the Git repository stays small.
+
+```bash
+scripts/bootstrap.sh
+```
+
+Inside the container, compile the project and OP-TEE images:
+
+This copies this repository's example code into the OP-TEE tree and builds the
+bootable QEMU images. The output includes the Normal World Linux image and the
+Secure World OP-TEE binaries.
+
+```bash
+scripts/build-project.sh
+```
+
+Start QEMU and run the project:
+
+This boots the compiled virtual TrustZone machine in QEMU and exposes its text
+consoles through tmux. The helper continues QEMU, switches to the console
+window, logs in as `root`, and runs the project edge-device client. The custom
+session name avoids collisions with other users or runs on `zeev`.
+
+```bash
+QEMU_TMUX_SESSION=your-name-please-edit scripts/run-project.sh
+```
+
+The Normal World and Secure World consoles are shown in the tmux console window.
+The helper waits for the `buildroot login:` prompt before typing `root`, then
+waits for the root shell prompt before running the project binary.
+
+The project edge-device program:
+
+This starts the Normal World edge-device client, which runs the current project
+stub flow and sends sensor data through the TEE client API into the Secure
+World. A successful response shows that Linux, OP-TEE, and the project Trusted
+Application can communicate correctly in QEMU.
+
+```bash
+optee_example_confidential_iot_edge
+```
+
+Expected output:
+
+```text
+edge_device: completed stub flow
+```
+
+## Running Multiple Devices Concurrently
+
+Each `scripts/run-project.sh` invocation needs its own terminal (it attaches to its own tmux
+session) and a distinct `QEMU_INSTANCE` index, so the gdbstub/serial ports and the default
+`device_id` don't collide with other running instances:
+
+```bash
+# terminal 2
+QEMU_TMUX_SESSION=optee-qemu-1 QEMU_INSTANCE=0 scripts/run-project.sh
+# terminal 3
+QEMU_TMUX_SESSION=optee-qemu-2 QEMU_INSTANCE=1 scripts/run-project.sh
+```
+
+Each instance auto-provisions itself (`provision-device.sh`) with its derived `device_id` before
+running the edge binary — boot plus provisioning can take a couple of minutes, since the fTPM
+device needs time to settle. See `docs/ATTESTATION_TESTING.md` §5 for the full walkthrough,
+including starting the server and registering each device.
+
+## Updating Project Source
+
+Edit files under `project/optee_examples/`. The helper scripts sync those files
+into `.optee-workspace/optee_examples/` before build and run.
+
+To resync manually inside the container:
+
+This copies changes from `project/optee_examples/` into OP-TEE's generated
+workspace without rebuilding everything immediately. Use it when you changed
+project source files and want the OP-TEE checkout to reflect those edits.
+
+```bash
+scripts/sync-project.sh
+```
+
+## Notes
+
+- Do not commit `.optee-workspace/`, `out/`, `out-br/`, `toolchains/`, nested
+  upstream `.git/` directories, IDE state, logs, or generated binaries.
+

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com"/>
+  <remote name="tfo" fetch="https://git.trustedfirmware.org"/>
+  
+  <default remote="github" revision="master"/>
+  
+  <project name="Mbed-TLS/mbedtls.git" path="mbedtls" revision="e185d7fd85499c8ce5ca2a54f5cf8fe7dbe3f8df" upstream="refs/tags/mbedtls-3.6.5" dest-branch="refs/tags/mbedtls-3.6.5" sync-s="true" clone-depth="1"/>
+  <project name="OP-TEE/build.git" path="build" revision="dc2393db1f077409be9e093457be7728fc3bbffe" upstream="master" dest-branch="master">
+    <linkfile src="qemu_v8.mk" dest="build/Makefile"/>
+  </project>
+  <project name="OP-TEE/optee_client.git" path="optee_client" revision="7101df580890d2e5cf53c3b1c3add3b38324500b" upstream="master" dest-branch="master"/>
+  <project name="OP-TEE/optee_ftpm.git" path="optee_ftpm" revision="e3b1e426a605e0537a3c3c9c24228eb22e354b80" upstream="master" dest-branch="master"/>
+  <project name="OP-TEE/optee_os.git" path="optee_os" revision="40b5e2035680207bd81b3bc4f9f0cdd4d14ea62a" upstream="master" dest-branch="master"/>
+  <project name="OP-TEE/optee_test.git" path="optee_test" revision="50f4db80b7a1888a8355a633039a9bcbf769677f" upstream="master" dest-branch="master"/>
+  <project name="TF-Hafnium/hafnium.git" path="hafnium" revision="ce12c6e53838f1cf07d50b616b72db57a81539a4" upstream="refs/tags/v2.14.0" dest-branch="refs/tags/v2.14.0" clone-depth="1"/>
+  <project name="TS/trusted-services.git" path="trusted-services" remote="tfo" revision="8881aaa3a9cb21e8b869e28c1a079f02fa46fd6c" clone-depth="1"/>
+  <project name="TrustedFirmware-A/trusted-firmware-a.git" path="trusted-firmware-a" revision="1d5aa939bc8d3d892e2ed9945fa50e36a1a924cc" upstream="refs/tags/v2.14.0" dest-branch="refs/tags/v2.14.0" sync-s="true" clone-depth="1"/>
+  <project name="apache/incubator-teaclave-trustzone-sdk.git" path="optee_rust" revision="746ee39f286788c049ddb55f57417ba97ed575a7" clone-depth="1"/>
+  <project name="buildroot/buildroot.git" path="buildroot" revision="71d1dddae12e7cbf322d96864d7757f459801f47" upstream="refs/tags/2026.02.2" dest-branch="refs/tags/2026.02.2" clone-depth="1"/>
+  <project name="linaro-swg/SCP-firmware.git" path="SCP-firmware" revision="190e938c2da3631b4834a90448516423099c79f7" upstream="refs/tags/v2.16.0" dest-branch="refs/tags/v2.16.0" clone-depth="1"/>
+  <project name="linaro-swg/linux-trusted-services.git" path="linux-arm-ffa-user" revision="885af0d1c3bf11aba12320d5484429160a9b9f26" upstream="refs/tags/debugfs-v5.0.2" dest-branch="refs/tags/debugfs-v5.0.2" clone-depth="1"/>
+  <project name="linaro-swg/linux.git" path="linux" revision="cf6e3218c25183cbc45551e85d0dd531f00fcc3d" upstream="optee" dest-branch="optee" clone-depth="1"/>
+  <project name="linaro-swg/optee_examples.git" path="optee_examples" revision="fa6ce94ff3858fc30a4705b46d75e0baf79d7561" upstream="master" dest-branch="master"/>
+  <project name="microsoft/ms-tpm-20-ref" path="ms-tpm-20-ref" revision="98b60a44aba79b15fcce1c0d1e46cf5918400f6a" clone-depth="1"/>
+  <project name="qemu/qemu.git" path="qemu" revision="7c949c53e936aa3a658d84ab53bae5cadaa5d59c" upstream="refs/tags/v10.0.0" dest-branch="refs/tags/v10.0.0" clone-depth="1"/>
+  <project name="u-boot/u-boot.git" path="u-boot" revision="e37de002fac3895e8d0b60ae2015e17bb33e2b5b" upstream="refs/tags/v2025.07" dest-branch="refs/tags/v2025.07" clone-depth="1"/>
+  <project name="xen-project/xen.git" path="xen" revision="3ad5d648cda5add395f49fc3704b2552aae734f7" upstream="refs/tags/RELEASE-4.20.0" dest-branch="refs/tags/RELEASE-4.20.0" clone-depth="1"/>
+</manifest>

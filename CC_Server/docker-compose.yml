@@ -1,0 +1,36 @@
+# Runs the Python Management Server (User<->Server side) in a container.
+#
+#   MS_USER_SECURITY=tls    docker compose up --build      # HTTPS 1.3 (default)
+#   MS_USER_SECURITY=aesgcm docker compose up --build      # HTTP + app-layer AES-GCM
+#
+# The OP-TEE/QEMU device (ConfidentialComputing-feature-stubs) is intentionally
+# NOT a service here — see INTEGRATION.md for how to attach that container to the
+# `iot-net` network once the device<->server link exists.
+
+services:
+  management-server:
+    build: .
+    image: management-server:latest
+    ports:
+      - "8000:8000"                       # user-facing UI + REST API
+      - "9000:9000"                       # device-facing DeviceLink port (network mode)
+    environment:
+      MS_API_HOST: "0.0.0.0"              # bind all interfaces (reachable from other containers)
+      MS_API_PORT: "8000"
+      MS_USER_SECURITY: "${MS_USER_SECURITY:-tls}"
+      # Data source: "stub" (default, synthetic) or "network" (fed by the edge device).
+      MS_DEVICE_LINK: "${MS_DEVICE_LINK:-stub}"
+      MS_DEVICE_HOST: "0.0.0.0"
+      MS_DEVICE_PORT: "9000"
+    volumes:
+      - server-certs:/app/server/certs    # persist the self-signed TLS cert
+    networks:
+      - iot-net
+    restart: unless-stopped
+
+volumes:
+  server-certs:
+
+networks:
+  iot-net:
+    name: iot-net                          # stable name so the OP-TEE container can join it

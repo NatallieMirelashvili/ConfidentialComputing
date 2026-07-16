@@ -1,0 +1,38 @@
+#!/bin/sh
+# Mount the persistent virtio-blk disk (attached by scripts/run-project.sh,
+# see docs/HANDOFF_persistentAK.md) at /var/lib/tee, before /etc/init.d/S30optee
+# starts tee-supplicant. Without this, OP-TEE's REE-FS secure storage - including
+# the fTPM's persisted Attestation Key at handle 0x8101000A - lives on the
+# ephemeral initrd and is wiped every reboot.
+#
+# Runs before S30optee: the S## prefix controls init ordering (this is S29).
+#
+# Idempotent/first-boot-safe: if the disk is already formatted (every boot
+# after the first), the mount succeeds directly. If it's blank raw storage
+# (first boot only), the mount fails, so we format it once and mount it -
+# no separate "is this formatted" probe needed.
+
+DEV=/dev/vda
+MOUNT_POINT=/var/lib/tee
+
+start() {
+	mkdir -p "$MOUNT_POINT"
+	printf 'Mounting %s at %s: ' "$DEV" "$MOUNT_POINT"
+	if mount -t ext4 "$DEV" "$MOUNT_POINT" 2>/dev/null; then
+		echo "OK"
+		return 0
+	fi
+	echo "not formatted, formatting"
+	mkfs.ext4 -F "$DEV" && mount -t ext4 "$DEV" "$MOUNT_POINT"
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop|restart|reload)
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1
+esac

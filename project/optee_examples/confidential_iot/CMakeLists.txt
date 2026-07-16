@@ -1,0 +1,34 @@
+project(optee_example_confidential_iot C)
+
+add_executable(optee_example_confidential_iot_edge
+	edge_device/host/main.c
+	edge_device/host/edge_device.c
+	edge_device/host/net.c
+	sensor_module/sensor_module.c
+	sensor_module/secure_element.c
+	attestation/attestation.c)
+
+target_include_directories(optee_example_confidential_iot_edge
+	PRIVATE edge_device/host
+	PRIVATE sensor_module
+	PRIVATE attestation
+	PRIVATE edge_device/ta/include)
+
+# mbedcrypto (mbedTLS's crypto-only lib: base64) and cJSON come from the
+# Buildroot packages enabled via project/buildroot/packages.conf; the
+# Buildroot cmake toolchain file points CMAKE_SYSROOT at the staging tree
+# where their headers and libraries are installed.
+target_link_libraries(optee_example_confidential_iot_edge
+	PRIVATE teec mbedcrypto cjson)
+
+install(TARGETS optee_example_confidential_iot_edge
+	DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(PROGRAMS scripts/provision-device.sh
+	DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Must run before /etc/init.d/S30optee (tee-supplicant) so OP-TEE's REE-FS
+# secure storage mounts onto the persistent disk first. See
+# scripts/S29tee-storage and docs/HANDOFF_persistentAK.md.
+install(PROGRAMS scripts/S29tee-storage
+	DESTINATION /etc/init.d)

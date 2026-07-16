@@ -1,0 +1,404 @@
+"""Device<->Server remote attestation tests.
+
+These build a syntactically-correct TPM2B_ATTEST + TPMT_SIGNATURE byte
+sequence in pure Python (real ECDSA signing via `cryptography`, no actual
+TPM/simulator involved) matching exactly what `attestation.py` expects to
+parse from `tpm2_quote -m`/`-s` output. This exercises the server-side
+parsing + verification logic end to end with real cryptographic operations,
+independent of whether the tpm2-tools CLI invocation in attestation.c turns
+out to need adjustment once tested against real hardware.
+
+Run:  python -m pytest server/tests -q     (from the project root)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import struct
+import threading
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+from server import constants as C
+from server import crypto
+from server.attestation import (
+    TPM_ALG_ECDSA,
+    TPM_ALG_SHA256,
+    TPM_GENERATED_VALUE,
+    TPM_ST_ATTEST_QUOTE,
+    AttestationError,
+    AttestationVerifier,
+    compute_transcript_hash,
+    recompute_pcr_digest,
+)
+from server.device_registry import DeviceRegistry
+
+
+def _tpm2b(data: bytes) -> bytes:
+    return struct.pack(">H", len(data)) + data
+
+
+def build_fake_quote_body(extra_data: bytes, pcr_digest: bytes) -> bytes:
+    """The marshaled TPMS_ATTEST (without the outer TPM2B_ATTEST size prefix)."""
+    body = struct.pack(">I", TPM_GENERATED_VALUE)
+    body += struct.pack(">H", TPM_ST_ATTEST_QUOTE)
+    body += _tpm2b(b"fake-qualified-signer-name")  # TPM2B_NAME (unchecked)
+    body += _tpm2b(extra_data)                      # TPM2B_DATA extraData
+    body += b"\x00" * 17                             # TPMS_CLOCK_INFO
+    body += struct.pack(">Q", 1)                     # firmwareVersion
+    # TPML_PCR_SELECTION: one bank (sha256), selecting PCR index 0.
+    body += struct.pack(">I", 1)
+    body += struct.pack(">H", TPM_ALG_SHA256)
+    body += struct.pack(">B", 3)
+    body += bytes([0x01, 0x00, 0x00])
+    body += _tpm2b(pcr_digest)                       # TPM2B_DIGEST pcrDigest
+    return body
+
+
+def build_fake_quote(extra_data: bytes, pcr_digest: bytes) -> bytes:
+    """A full TPM2B_ATTEST: 2-byte size prefix + the TPMS_ATTEST body."""
+    return _tpm2b(build_fake_quote_body(extra_data, pcr_digest))
+
+
+def sign_quote_body(ak_priv: ec.EllipticCurvePrivateKey, body: bytes) -> bytes:
+    """A TPMT_SIGNATURE (ECDSA/P-256/SHA-256) over the quote body."""
+    from cryptography.hazmat.primitives import hashes
+
+    der_sig = ak_priv.sign(body, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der_sig)
+    sig = struct.pack(">H", TPM_ALG_ECDSA)
+    sig += struct.pack(">H", TPM_ALG_SHA256)
+    sig += _tpm2b(r.to_bytes(32, "big"))
+    sig += _tpm2b(s.to_bytes(32, "big"))
+    return sig
+
+
+def _ak_pub_pem(ak_priv: ec.EllipticCurvePrivateKey) -> str:
+    return ak_priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+
+
+class _Fixture:
+    """One enrolled fake device + a fresh challenge, ready to answer."""
+
+    def __init__(self, tmp_path, device_id: str = "iot-edge-test") -> None:
+        self.device_id = device_id
+        self.ak_priv = ec.generate_private_key(ec.SECP256R1())
+        self.pcr0 = hashlib.sha256(b"known-good-firmware").digest()
+        self.pcr_text = f"sha256:\n  0 : 0x{self.pcr0.hex()}\n"
+
+        self.registry = DeviceRegistry(path=str(tmp_path / "device_registry.json"))
+        self.registry.register(
+            device_id, _ak_pub_pem(self.ak_priv), self.pcr_text, "sha256:0"
+        )
+        self.verifier = AttestationVerifier(registry=self.registry)
+
+    def challenge(self) -> tuple[bytes, bytes]:
+        c = self.verifier.issue_challenge(self.device_id)
+        return crypto.b64d(c["nonce"]), crypto.b64d(c["server_ecdh_pub"])
+
+    def build_response(self, nonce: bytes, server_pub: bytes, pcr_text: str | None = None):
+        """Builds a genuine, correctly-signed attest_response for this
+        challenge - callers mutate individual fields to test rejection paths."""
+        device_priv, device_pub = crypto.p256_generate()
+        transcript_hash = compute_transcript_hash(nonce, server_pub, device_pub)
+        pcr_digest = recompute_pcr_digest(pcr_text if pcr_text is not None else self.pcr_text)
+        quote = build_fake_quote(transcript_hash, pcr_digest)
+        sig = sign_quote_body(self.ak_priv, quote[2:])
+        return device_priv, device_pub, quote, sig
+
+
+def test_attestation_full_roundtrip(tmp_path):
+    """A genuine, correctly-signed response is accepted and both sides derive
+    the identical AES-256 session key, which then round-trips a data payload
+    exactly like the device<->server "data" message would."""
+    fx = _Fixture(tmp_path)
+    nonce, server_pub = fx.challenge()
+    device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+
+    fx.verifier.verify_and_derive(
+        device_id=fx.device_id,
+        device_ecdh_pub_b64=crypto.b64e(device_pub),
+        quote_b64=crypto.b64e(quote),
+        signature_b64=crypto.b64e(sig),
+        pcr_values_text=fx.pcr_text,
+    )
+
+    key = fx.verifier.session_key(fx.device_id)
+    assert key is not None
+
+    # The device derives the same key independently from its own ECDH private
+    # key + the server's public key + the same nonce/info.
+    shared = crypto.p256_shared(device_priv, server_pub)
+    expected_key = crypto.hkdf(shared, salt=nonce, info=C.INFO_DEVICE_AEAD)
+    assert key == expected_key
+
+    # And the resulting key actually protects a "data" payload end to end,
+    # with the per-message seq authenticated as the AAD (matches the TA + the
+    # attested_network link).
+    payload = json.dumps({"samples": [{"value": 23.5, "unit": "C"}]}).encode()
+    data_nonce = crypto.random_bytes(12)
+    aad = (1).to_bytes(8, "big")
+    ct = crypto.aead_encrypt(key, data_nonce, payload, aad=aad)
+    assert crypto.aead_decrypt(key, data_nonce, ct, aad=aad) == payload
+
+
+def test_attestation_rejects_unregistered_device(tmp_path):
+    registry = DeviceRegistry(path=str(tmp_path / "device_registry.json"))
+    verifier = AttestationVerifier(registry=registry)
+    with pytest.raises(AttestationError):
+        verifier.issue_challenge("never-enrolled")
+
+
+def test_attestation_rejects_bad_signature(tmp_path):
+    """A quote signed by the wrong key must be rejected."""
+    fx = _Fixture(tmp_path)
+    nonce, server_pub = fx.challenge()
+    device_priv, device_pub, quote, _real_sig = fx.build_response(nonce, server_pub)
+
+    wrong_key = ec.generate_private_key(ec.SECP256R1())
+    bad_sig = sign_quote_body(wrong_key, quote[2:])
+
+    with pytest.raises(AttestationError):
+        fx.verifier.verify_and_derive(
+            device_id=fx.device_id,
+            device_ecdh_pub_b64=crypto.b64e(device_pub),
+            quote_b64=crypto.b64e(quote),
+            signature_b64=crypto.b64e(bad_sig),
+            pcr_values_text=fx.pcr_text,
+        )
+    assert fx.verifier.session_key(fx.device_id) is None
+
+
+def test_attestation_rejects_pcr_mismatch(tmp_path):
+    """A quote over the wrong (tampered) PCR baseline must be rejected."""
+    fx = _Fixture(tmp_path)
+    nonce, server_pub = fx.challenge()
+
+    tampered_pcr = f"sha256:\n  0 : 0x{hashlib.sha256(b'tampered-firmware').hexdigest()}\n"
+    device_priv, device_pub, quote, sig = fx.build_response(
+        nonce, server_pub, pcr_text=tampered_pcr
+    )
+
+    with pytest.raises(AttestationError):
+        fx.verifier.verify_and_derive(
+            device_id=fx.device_id,
+            device_ecdh_pub_b64=crypto.b64e(device_pub),
+            quote_b64=crypto.b64e(quote),
+            signature_b64=crypto.b64e(sig),
+            pcr_values_text=tampered_pcr,
+        )
+    assert fx.verifier.session_key(fx.device_id) is None
+
+
+def test_attested_network_link_full_protocol(tmp_path):
+    """Drives AttestedNetworkDeviceLink's per-connection state machine
+    directly (hello -> attest_challenge -> attest_response -> attest_result
+    -> data) via a fake readline/writeline pair, without opening a real
+    socket - the TCP framing itself is stdlib socketserver, not worth
+    re-testing. `readline` is stateful: it reacts to what the server has
+    already written, exactly like a real device would react to each reply,
+    all within one continuous simulated connection (state_id persists)."""
+    from collections import defaultdict, deque
+    from server.device_link import attested_network as an
+
+    link = an.AttestedNetworkDeviceLink.__new__(an.AttestedNetworkDeviceLink)
+    link._buf = defaultdict(lambda: deque(maxlen=100))
+    link._verdict = {}
+    link._lock = threading.Lock()
+
+    fx = _Fixture(tmp_path, device_id="iot-edge-live")
+    link._verifier = fx.verifier
+
+    outgoing: list[dict] = []
+    step = {"n": 0}
+    session_key: dict[str, bytes] = {}
+
+    def readline():
+        step["n"] += 1
+        if step["n"] == 1:
+            return json.dumps({"type": "hello", "device_id": fx.device_id})
+        if step["n"] == 2:
+            challenge = outgoing[-1]
+            nonce = crypto.b64d(challenge["nonce"])
+            server_pub = crypto.b64d(challenge["server_ecdh_pub"])
+            device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+            session_key["key"] = crypto.hkdf(
+                crypto.p256_shared(device_priv, server_pub),
+                salt=nonce, info=C.INFO_DEVICE_AEAD,
+            )
+            return json.dumps({
+                "type": "attest_response",
+                "device_id": fx.device_id,
+                "device_ecdh_pub": crypto.b64e(device_pub),
+                "quote": crypto.b64e(quote),
+                "signature": crypto.b64e(sig),
+                "pcr_values": fx.pcr_text,
+            })
+        if step["n"] == 3:
+            key = session_key["key"]
+            data_nonce = crypto.random_bytes(12)
+            payload = json.dumps({"samples": [{"value": 42.0, "unit": "C"}]}).encode()
+            seq = 1
+            ct = crypto.aead_encrypt(key, data_nonce, payload,
+                                     aad=seq.to_bytes(8, "big"))
+            return json.dumps({
+                "type": "data",
+                "device_id": fx.device_id,
+                "seq": seq,
+                "nonce": crypto.b64e(data_nonce),
+                "ciphertext": crypto.b64e(ct),
+            })
+        # Called again right after the data message was processed -> the
+        # connection is still open at this point, so the verdict must
+        # already reflect a live, attested, integrity-ok session before we
+        # simulate the disconnect below.
+        assert link._verdict[fx.device_id]["attested"] is True
+        assert link._verdict[fx.device_id]["integrity"] == "ok"
+        return None  # simulated disconnect
+
+    def writeline(obj):
+        outgoing.append(obj)
+
+    link._handle_connection(readline, writeline)
+
+    assert outgoing[0]["type"] == "attest_challenge"
+    assert outgoing[1] == {
+        "type": "attest_result", "ok": True,
+        "session_ttl": C.DEVICE_SESSION_TTL_SECONDS,
+    }
+    assert outgoing[2] == {"ok": True}
+
+    # Once the connection has ended, the cached verdict must reflect that -
+    # not keep reporting a stale "attested/ok" for a device that's now gone
+    # (the sample it sent while still connected is still delivered, though).
+    batch = asyncio.run(link.collect(fx.device_id, "1h"))
+    assert batch.attested is False
+    assert batch.note == "device disconnected"
+    assert len(batch.samples) == 1
+    assert batch.samples[0].value == 42.0
+
+
+def test_check_and_advance_seq_enforces_monotonicity(tmp_path):
+    """Unit-level: the anti-replay counter accepts only strictly-increasing,
+    in-range seqs and never a repeat/regress/booleans."""
+    fx = _Fixture(tmp_path)
+    nonce, server_pub = fx.challenge()
+    device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+    fx.verifier.verify_and_derive(
+        device_id=fx.device_id,
+        device_ecdh_pub_b64=crypto.b64e(device_pub),
+        quote_b64=crypto.b64e(quote),
+        signature_b64=crypto.b64e(sig),
+        pcr_values_text=fx.pcr_text,
+    )
+    v = fx.verifier
+    assert v.check_and_advance_seq(fx.device_id, 1) is True
+    assert v.check_and_advance_seq(fx.device_id, 2) is True
+    assert v.check_and_advance_seq(fx.device_id, 2) is False   # replay
+    assert v.check_and_advance_seq(fx.device_id, 1) is False   # regress
+    assert v.check_and_advance_seq(fx.device_id, 5) is True    # gaps allowed
+    assert v.check_and_advance_seq(fx.device_id, 0) is False   # out of range
+    assert v.check_and_advance_seq(fx.device_id, True) is False  # bool != int
+    assert v.check_and_advance_seq("unknown-device", 1) is False
+
+
+def test_attested_network_rejects_replayed_data(tmp_path):
+    """An attacker capturing a valid, AEAD-authenticated `data` message and
+    re-sending it byte-for-byte within the same session must be rejected: its
+    seq was already accepted, so it is not buffered a second time."""
+    from collections import defaultdict, deque
+    from server.device_link import attested_network as an
+
+    link = an.AttestedNetworkDeviceLink.__new__(an.AttestedNetworkDeviceLink)
+    link._buf = defaultdict(lambda: deque(maxlen=100))
+    link._verdict = {}
+    link._lock = threading.Lock()
+
+    fx = _Fixture(tmp_path, device_id="iot-edge-replay")
+    link._verifier = fx.verifier
+
+    outgoing: list[dict] = []
+    step = {"n": 0}
+    captured: dict[str, str] = {}
+
+    def readline():
+        step["n"] += 1
+        if step["n"] == 1:
+            return json.dumps({"type": "hello", "device_id": fx.device_id})
+        if step["n"] == 2:
+            challenge = outgoing[-1]
+            nonce = crypto.b64d(challenge["nonce"])
+            server_pub = crypto.b64d(challenge["server_ecdh_pub"])
+            device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+            key = crypto.hkdf(
+                crypto.p256_shared(device_priv, server_pub),
+                salt=nonce, info=C.INFO_DEVICE_AEAD,
+            )
+            data_nonce = crypto.random_bytes(12)
+            payload = json.dumps({"samples": [{"value": 7.0, "unit": "C"}]}).encode()
+            seq = 1
+            ct = crypto.aead_encrypt(key, data_nonce, payload,
+                                     aad=seq.to_bytes(8, "big"))
+            captured["data"] = json.dumps({
+                "type": "data", "device_id": fx.device_id, "seq": seq,
+                "nonce": crypto.b64e(data_nonce), "ciphertext": crypto.b64e(ct),
+            })
+            return json.dumps({
+                "type": "attest_response",
+                "device_id": fx.device_id,
+                "device_ecdh_pub": crypto.b64e(device_pub),
+                "quote": crypto.b64e(quote),
+                "signature": crypto.b64e(sig),
+                "pcr_values": fx.pcr_text,
+            })
+        if step["n"] == 3:
+            return captured["data"]            # first, legitimate delivery
+        if step["n"] == 4:
+            return captured["data"]            # exact replay
+        return None
+
+    def writeline(obj):
+        outgoing.append(obj)
+
+    link._handle_connection(readline, writeline)
+
+    batch = asyncio.run(link.collect(fx.device_id, "1h"))
+    # Only the first delivery was buffered; the replay was dropped and left the
+    # latest verdict marking integrity failure.
+    assert len(batch.samples) == 1
+    assert batch.integrity == "fail"
+
+
+def test_attestation_rejects_replayed_response(tmp_path):
+    """The same (previously valid) response can't be replayed for a second,
+    independent challenge - each challenge's nonce is single-use."""
+    fx = _Fixture(tmp_path)
+    nonce, server_pub = fx.challenge()
+    device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+
+    fx.verifier.verify_and_derive(
+        device_id=fx.device_id,
+        device_ecdh_pub_b64=crypto.b64e(device_pub),
+        quote_b64=crypto.b64e(quote),
+        signature_b64=crypto.b64e(sig),
+        pcr_values_text=fx.pcr_text,
+    )
+
+    # No new hello/challenge was issued - replaying the exact same response
+    # must fail because the challenge was already consumed.
+    with pytest.raises(AttestationError):
+        fx.verifier.verify_and_derive(
+            device_id=fx.device_id,
+            device_ecdh_pub_b64=crypto.b64e(device_pub),
+            quote_b64=crypto.b64e(quote),
+            signature_b64=crypto.b64e(sig),
+            pcr_values_text=fx.pcr_text,
+        )

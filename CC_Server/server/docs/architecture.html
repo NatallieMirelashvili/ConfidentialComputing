@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Management Server — Architecture &amp; Walkthrough</title>
+<style>
+  :root {
+    --bg:#0f1420; --card:#1a2233; --card2:#131a28; --fg:#e6ebf5; --muted:#93a0b8;
+    --accent:#4c8dff; --ok:#2fbf71; --bad:#e0556b; --amber:#e8b13b; --border:#27324a;
+    --code:#0c1120;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f3f5fa; --card:#fff; --card2:#f7f9fd; --fg:#16202e; --muted:#5c6b82;
+            --border:#e0e6f0; --code:#0f1522; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:15.5px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:960px; margin:0 auto; padding:40px 22px 80px; }
+  h1 { font-size:2rem; margin:0 0 6px; }
+  h2 { font-size:1.35rem; margin:44px 0 14px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+  h3 { font-size:1.05rem; margin:26px 0 8px; }
+  p.lead { color:var(--muted); font-size:1.05rem; margin-top:0; }
+  .tag { display:inline-block; padding:3px 10px; border-radius:999px; font-size:.78rem;
+    font-weight:600; border:1px solid var(--border); background:var(--card2); color:var(--muted); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:720px){ .grid2 { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px 20px; }
+  .card h3 { margin-top:0; }
+  .muted { color:var(--muted); }
+  code { background:var(--card2); padding:1px 6px; border-radius:6px; font-size:.9em; }
+  pre { background:var(--code); color:#d7e0f5; border:1px solid var(--border); border-radius:10px;
+    padding:14px 16px; overflow-x:auto; font-size:.84rem; line-height:1.55; }
+  pre .k { color:#6ea8ff; } pre .s { color:#7fd98c; } pre .c { color:#6b7890; } pre .fn { color:#e8b13b; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  th,td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .chip { padding:3px 9px; border-radius:999px; font-size:.78rem; font-weight:600; border:1px solid var(--border); }
+  .chip.ok{color:var(--ok);border-color:rgba(47,191,113,.4);background:rgba(47,191,113,.12);}
+  .chip.tls{color:var(--ok);} .chip.aes{color:var(--accent);}
+  figure { margin:16px 0; }
+  figcaption { color:var(--muted); font-size:.85rem; margin-top:6px; text-align:center; }
+  svg { max-width:100%; height:auto; display:block; margin:0 auto; }
+  .diagram { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; }
+  .legend { font-size:.8rem; color:var(--muted); display:flex; gap:16px; flex-wrap:wrap; justify-content:center; margin-top:8px;}
+  .legend span::before{content:"";display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:middle;}
+  .lg-user::before{background:#4c8dff;} .lg-app::before{background:#2fbf71;} .lg-seam::before{background:#e8b13b;}
+  .toc { columns:2; font-size:.92rem; } @media(max-width:600px){.toc{columns:1;}}
+  .toc a { color:var(--accent); text-decoration:none; }
+  footer { margin-top:60px; color:var(--muted); font-size:.85rem; border-top:1px solid var(--border); padding-top:16px; }
+  /* svg text */
+  text { font-family:system-ui,sans-serif; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <span class="tag">Confidential Computing · Group 4</span>
+  <h1>Management Server — Architecture &amp; Walkthrough</h1>
+  <p class="lead">The <strong>User&nbsp;↔&nbsp;Server</strong> half of the system: an HTML UI + REST API
+  with <strong>selectable transport security</strong> (TLS&nbsp;1.3 or application-layer AES-256-GCM).
+  Sensor data enters through a clean <strong>DeviceLink seam</strong> (a synthetic stub here).</p>
+
+  <div class="card" style="margin-top:18px">
+    <strong>On this page</strong>
+    <div class="toc" style="margin-top:8px">
+      <a href="#overview">1. Overview &amp; scope</a><br/>
+      <a href="#arch">2. Architecture</a><br/>
+      <a href="#modes">3. The two transport modes</a><br/>
+      <a href="#flow">4. Collect data-flow</a><br/>
+      <a href="#map">5. Module &amp; class map</a><br/>
+      <a href="#code">6. Key code walkthrough</a><br/>
+      <a href="#chart">7. Aggregations illustrated</a><br/>
+      <a href="#run">8. How to run</a>
+    </div>
+    <p class="muted" style="margin:12px 0 0">See also →
+      <a href="runtime.html"><strong>runtime.html</strong></a> — a function-level trace of what
+      runs when you open the server, click Collect, and get the response.</p>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="overview">1 · Overview &amp; scope</h2>
+  <p>An IoT edge device (emulated with OP-TEE / ARM TrustZone) collects sensor data and sends it to
+  this <strong>Management Server</strong>, which serves an end user. This codebase implements the
+  <strong>user-facing half</strong> only.</p>
+  <div class="grid2">
+    <div class="card">
+      <h3>In scope (built here)</h3>
+      <ul style="margin:0;padding-left:18px">
+        <li>HTML UI + REST API</li>
+        <li>Two swappable <em>User↔Server</em> security modes: <span class="chip tls">TLS 1.3</span> · <span class="chip aes">AES-256-GCM</span></li>
+        <li>Collect → store → aggregate (weighted average, mean, …)</li>
+        <li>A stable <code>DeviceLink</code> seam + runnable stub</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Out of scope</h3>
+      <ul style="margin:0;padding-left:18px">
+        <li>Server↔Device remote attestation</li>
+        <li>Device key exchange &amp; encrypted sensor channel</li>
+      </ul>
+      <p class="muted" style="margin:10px 0 0">Sensor data here comes from
+      <code>StubDeviceLink</code> behind the <code>DeviceLink</code> seam; the real device
+      side is a separate part of the project.</p>
+    </div>
+  </div>
+
+  <!-- 2 -->
+  <h2 id="arch">2 · Architecture</h2>
+  <p>Every request flows through the selected <code>UserChannel</code> (security), into thin FastAPI
+  routes, to the <code>CollectionService</code> (business logic), and only reaches sensor data through
+  the <code>DeviceLink</code> seam.</p>
+  <figure>
+    <div class="diagram">
+    <svg viewBox="0 0 900 300" role="img" aria-label="Architecture diagram">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path d="M0,0 L7,3 L0,6 Z" fill="#93a0b8"/>
+        </marker>
+      </defs>
+      <!-- user zone -->
+      <rect x="10" y="60" width="150" height="120" rx="10" fill="#4c8dff22" stroke="#4c8dff" stroke-width="1.5"/>
+      <text x="85" y="46" text-anchor="middle" fill="#93a0b8" font-size="13">user zone</text>
+      <rect x="30" y="80" width="110" height="34" rx="7" fill="#4c8dff33" stroke="#4c8dff"/>
+      <text x="85" y="102" text-anchor="middle" fill="#e6ebf5" font-size="13">Browser UI</text>
+      <text x="85" y="140" text-anchor="middle" fill="#93a0b8" font-size="11">web/index.html</text>
+      <text x="85" y="156" text-anchor="middle" fill="#93a0b8" font-size="11">app.js (WebCrypto)</text>
+
+      <!-- channel -->
+      <rect x="210" y="70" width="140" height="100" rx="10" fill="#2fbf7122" stroke="#2fbf71" stroke-width="1.5"/>
+      <text x="280" y="46" text-anchor="middle" fill="#93a0b8" font-size="13">transport security</text>
+      <text x="280" y="108" text-anchor="middle" fill="#e6ebf5" font-size="13">UserChannel</text>
+      <text x="280" y="128" text-anchor="middle" fill="#2fbf71" font-size="11">TLS 1.3</text>
+      <text x="280" y="144" text-anchor="middle" fill="#4c8dff" font-size="11">or AES-GCM</text>
+
+      <!-- app zone -->
+      <rect x="400" y="30" width="230" height="240" rx="10" fill="#2fbf7115" stroke="#2fbf71" stroke-width="1.5"/>
+      <text x="515" y="20" text-anchor="middle" fill="#93a0b8" font-size="13">server (Python / FastAPI)</text>
+      <rect x="420" y="46" width="190" height="34" rx="7" fill="#2fbf7133" stroke="#2fbf71"/>
+      <text x="515" y="68" text-anchor="middle" fill="#e6ebf5" font-size="13">FastAPI routes</text>
+      <rect x="420" y="96" width="190" height="34" rx="7" fill="#2fbf7133" stroke="#2fbf71"/>
+      <text x="515" y="118" text-anchor="middle" fill="#e6ebf5" font-size="13">CollectionService</text>
+      <rect x="420" y="146" width="90" height="30" rx="7" fill="#131a28" stroke="#27324a"/>
+      <text x="465" y="166" text-anchor="middle" fill="#e6ebf5" font-size="12">DataStore</text>
+      <rect x="520" y="146" width="90" height="30" rx="7" fill="#131a28" stroke="#27324a"/>
+      <text x="565" y="166" text-anchor="middle" fill="#e6ebf5" font-size="12">processing</text>
+      <rect x="420" y="196" width="190" height="40" rx="7" fill="#e8b13b22" stroke="#e8b13b" stroke-width="1.5"/>
+      <text x="515" y="220" text-anchor="middle" fill="#e6ebf5" font-size="13">DeviceLink (seam)</text>
+
+      <!-- data source zone -->
+      <rect x="680" y="165" width="200" height="70" rx="10" fill="#e8b13b12" stroke="#e8b13b" stroke-dasharray="5 4"/>
+      <text x="780" y="152" text-anchor="middle" fill="#93a0b8" font-size="13">data source</text>
+      <rect x="700" y="185" width="160" height="34" rx="7" fill="#131a28" stroke="#27324a"/>
+      <text x="780" y="207" text-anchor="middle" fill="#e6ebf5" font-size="12">StubDeviceLink</text>
+
+      <!-- arrows -->
+      <line x1="140" y1="97" x2="208" y2="110" stroke="#93a0b8" marker-end="url(#ah)"/>
+      <line x1="350" y1="110" x2="418" y2="63" stroke="#93a0b8" marker-end="url(#ah)"/>
+      <line x1="515" y1="80" x2="515" y2="94" stroke="#93a0b8" marker-end="url(#ah)"/>
+      <line x1="515" y1="130" x2="515" y2="144" stroke="#93a0b8" marker-end="url(#ah)"/>
+      <line x1="515" y1="176" x2="515" y2="194" stroke="#93a0b8" marker-end="url(#ah)"/>
+      <line x1="610" y1="216" x2="700" y2="200" stroke="#93a0b8" marker-end="url(#ah)"/>
+    </svg>
+    </div>
+    <figcaption>Left→right dependency. The dashed box is the data source, reached only via the seam.</figcaption>
+    <div class="legend"><span class="lg-user">user zone</span><span class="lg-app">server logic</span><span class="lg-seam">device seam</span></div>
+  </figure>
+
+  <!-- 3 -->
+  <h2 id="modes">3 · The two transport modes</h2>
+  <p>Both satisfy one interface (<code>UserChannel</code>), so the routes are written once. You pick one
+  at launch with <code>--security tls|aesgcm</code>.</p>
+  <div class="grid2">
+    <figure>
+      <div class="diagram">
+      <svg viewBox="0 0 380 300" role="img" aria-label="TLS mode sequence">
+        <text x="80" y="20" text-anchor="middle" fill="#2fbf71" font-size="13" font-weight="700">TLS 1.3</text>
+        <text x="80" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Browser</text>
+        <text x="300" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Server (https)</text>
+        <line x1="80" y1="48" x2="80" y2="280" stroke="#27324a"/>
+        <line x1="300" y1="48" x2="300" y2="280" stroke="#27324a"/>
+        <line x1="80" y1="80" x2="300" y2="80" stroke="#2fbf71" marker-end="url(#ah)"/>
+        <text x="190" y="74" text-anchor="middle" fill="#93a0b8" font-size="11">TLS 1.3 handshake (library)</text>
+        <line x1="300" y1="112" x2="80" y2="112" stroke="#2fbf71" marker-end="url(#ah)"/>
+        <text x="190" y="106" text-anchor="middle" fill="#93a0b8" font-size="11">encrypted tunnel established</text>
+        <line x1="80" y1="160" x2="300" y2="160" stroke="#4c8dff" marker-end="url(#ah)"/>
+        <text x="190" y="154" text-anchor="middle" fill="#93a0b8" font-size="11">POST /api/collect (plain JSON)</text>
+        <line x1="300" y1="200" x2="80" y2="200" stroke="#4c8dff" marker-end="url(#ah)"/>
+        <text x="190" y="194" text-anchor="middle" fill="#93a0b8" font-size="11">result JSON</text>
+        <text x="190" y="245" text-anchor="middle" fill="#93a0b8" font-size="10.5">app sees plain JSON;</text>
+        <text x="190" y="260" text-anchor="middle" fill="#93a0b8" font-size="10.5">TLS encrypts the wire</text>
+      </svg>
+      </div>
+      <figcaption><code>transport/tls.py</code> — self-signed cert, strict TLS-1.3-only context.</figcaption>
+    </figure>
+    <figure>
+      <div class="diagram">
+      <svg viewBox="0 0 380 300" role="img" aria-label="AES-GCM mode sequence">
+        <text x="80" y="20" text-anchor="middle" fill="#4c8dff" font-size="13" font-weight="700">AES-256-GCM</text>
+        <text x="80" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Browser</text>
+        <text x="300" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Server (http)</text>
+        <line x1="80" y1="48" x2="80" y2="285" stroke="#27324a"/>
+        <line x1="300" y1="48" x2="300" y2="285" stroke="#27324a"/>
+        <line x1="80" y1="76" x2="300" y2="76" stroke="#4c8dff" marker-end="url(#ah)"/>
+        <text x="190" y="70" text-anchor="middle" fill="#93a0b8" font-size="11">/handshake: client P-256 pub</text>
+        <line x1="300" y1="104" x2="80" y2="104" stroke="#4c8dff" marker-end="url(#ah)"/>
+        <text x="190" y="98" text-anchor="middle" fill="#93a0b8" font-size="11">server pub + session_id</text>
+        <text x="190" y="128" text-anchor="middle" fill="#2fbf71" font-size="10.5">both: ECDH → HKDF → AES key</text>
+        <line x1="80" y1="158" x2="300" y2="158" stroke="#e8b13b" marker-end="url(#ah)"/>
+        <text x="190" y="152" text-anchor="middle" fill="#93a0b8" font-size="11">/collect  {iv, ct}  + X-Session-Id</text>
+        <line x1="300" y1="192" x2="80" y2="192" stroke="#e8b13b" marker-end="url(#ah)"/>
+        <text x="190" y="186" text-anchor="middle" fill="#93a0b8" font-size="11">{iv, ct}  (response)</text>
+        <text x="190" y="235" text-anchor="middle" fill="#93a0b8" font-size="10.5">middleware decrypts in /</text>
+        <text x="190" y="250" text-anchor="middle" fill="#93a0b8" font-size="10.5">encrypts out — routes unchanged</text>
+        <text x="190" y="270" text-anchor="middle" fill="#e8b13b" font-size="10.5">on the wire: ciphertext only</text>
+      </svg>
+      </div>
+      <figcaption><code>transport/aesgcm.py</code> — ECDH handshake + ASGI envelope middleware.</figcaption>
+    </figure>
+  </div>
+
+  <!-- 4 -->
+  <h2 id="flow">4 · Collect data-flow</h2>
+  <p>What happens when the user clicks <strong>Collect</strong>:</p>
+  <figure>
+    <div class="diagram">
+    <svg viewBox="0 0 900 120" role="img" aria-label="Collect data-flow">
+      <defs>
+        <marker id="ah2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#93a0b8"/></marker>
+      </defs>
+      <g font-size="12" fill="#e6ebf5">
+        <rect x="8"   y="40" width="120" height="42" rx="8" fill="#4c8dff22" stroke="#4c8dff"/><text x="68"  y="66" text-anchor="middle">UI: POST /collect</text>
+        <rect x="168" y="40" width="120" height="42" rx="8" fill="#2fbf7122" stroke="#2fbf71"/><text x="228" y="60" text-anchor="middle">Collection</text><text x="228" y="74" text-anchor="middle">Service</text>
+        <rect x="328" y="40" width="120" height="42" rx="8" fill="#e8b13b22" stroke="#e8b13b"/><text x="388" y="66" text-anchor="middle">DeviceLink</text>
+        <rect x="488" y="40" width="120" height="42" rx="8" fill="#131a28" stroke="#27324a"/><text x="548" y="66" text-anchor="middle">DataStore</text>
+        <rect x="648" y="40" width="120" height="42" rx="8" fill="#131a28" stroke="#27324a"/><text x="708" y="60" text-anchor="middle">processing</text><text x="708" y="74" text-anchor="middle">aggregate</text>
+        <rect x="808" y="40" width="84" height="42" rx="8" fill="#4c8dff22" stroke="#4c8dff"/><text x="850" y="60" text-anchor="middle">result +</text><text x="850" y="74" text-anchor="middle">verdict</text>
+      </g>
+      <g stroke="#93a0b8" marker-end="url(#ah2)">
+        <line x1="128" y1="61" x2="166" y2="61"/><line x1="288" y1="61" x2="326" y2="61"/>
+        <line x1="448" y1="61" x2="486" y2="61"/><line x1="608" y1="61" x2="646" y2="61"/>
+        <line x1="768" y1="61" x2="806" y2="61"/>
+      </g>
+    </svg>
+    </div>
+    <figcaption>The Batch returned by the DeviceLink carries the verification verdict
+    (<span class="chip ok">attested</span> / integrity / measurement) shown in the UI.</figcaption>
+  </figure>
+
+  <!-- 5 -->
+  <h2 id="map">5 · Module &amp; class map</h2>
+  <table>
+    <tr><th>File</th><th>Kind</th><th>Responsibility</th></tr>
+    <tr><td><code>config.py</code></td><td>class <code>Config</code></td><td>The only reader of environment variables; one source of truth.</td></tr>
+    <tr><td><code>constants.py</code></td><td>module</td><td>Pure constants (modes, crypto params, windows, aggregations).</td></tr>
+    <tr><td><code>main.py</code></td><td>entry point</td><td>Parse <code>--security</code>, build the app, run uvicorn (TLS ctx if needed).</td></tr>
+    <tr><td><code>app_server.py</code></td><td>factory</td><td>Thin FastAPI routes; delegate to the service and the channel.</td></tr>
+    <tr><td><code>service.py</code></td><td>class <code>CollectionService</code></td><td>Business logic: DeviceLink → DataStore → processing.</td></tr>
+    <tr><td><code>store.py</code></td><td>class <code>DataStore</code></td><td>In-memory samples + time-window filter.</td></tr>
+    <tr><td><code>processing.py</code></td><td>functions</td><td>Aggregations: raw / mean / min / max / weighted_avg.</td></tr>
+    <tr><td><code>transport/base.py</code></td><td>class <code>UserChannel</code></td><td>The security interface (ssl_context / install / describe).</td></tr>
+    <tr><td><code>transport/tls.py</code></td><td>class <code>TlsUserChannel</code></td><td>TLS 1.3: self-signed cert + strict SSLContext.</td></tr>
+    <tr><td><code>transport/aesgcm.py</code></td><td>classes</td><td>ECDH handshake + <code>_AeadASGIMiddleware</code> envelope crypto.</td></tr>
+    <tr><td><code>crypto.py</code></td><td>functions</td><td>P-256 ECDH, HKDF, AES-GCM (used by aesgcm mode).</td></tr>
+    <tr><td><code>device_link/base.py</code></td><td>class <code>DeviceLink</code></td><td>The seam + <code>Sample</code>/<code>Batch</code> types.</td></tr>
+    <tr><td><code>device_link/stub.py</code></td><td>class <code>StubDeviceLink</code></td><td>Synthetic attested data — the data source.</td></tr>
+    <tr><td><code>web/</code></td><td>UI</td><td>index.html + app.js (WebCrypto for aesgcm) + styles.css.</td></tr>
+  </table>
+
+  <!-- 6 -->
+  <h2 id="code">6 · Key code walkthrough</h2>
+
+  <h3>One interface, two security modes</h3>
+  <pre><code><span class="k">class</span> <span class="fn">UserChannel</span>(ABC):        <span class="c"># transport/base.py</span>
+    <span class="k">def</span> <span class="fn">ssl_context</span>(self) -> ssl.SSLContext | None: ...  <span class="c"># TLS returns ctx; AES-GCM None</span>
+    <span class="k">def</span> <span class="fn">install</span>(self, app): ...   <span class="c"># AES-GCM adds /handshake + middleware</span>
+    <span class="k">def</span> <span class="fn">describe</span>(self) -> dict: ...  <span class="c"># tells the browser which mode is active</span></code></pre>
+
+  <h3>AES-GCM envelope middleware (pure ASGI)</h3>
+  <pre><code><span class="c"># transport/aesgcm.py — decrypt the request in, encrypt the response out,</span>
+<span class="c"># so the routes never change between modes.</span>
+plaintext = crypto.<span class="fn">aead_decrypt</span>(key, iv, ct, b<span class="s">""</span>)   <span class="c"># request body {iv,ct} -> JSON</span>
+...
+ct = crypto.<span class="fn">aead_encrypt</span>(key, new_iv, response_body, b<span class="s">""</span>)  <span class="c"># -> {iv,ct} on the wire</span></code></pre>
+
+  <h3>The seam — the only way sensor data enters</h3>
+  <pre><code><span class="k">class</span> <span class="fn">DeviceLink</span>(ABC):          <span class="c"># device_link/base.py</span>
+    <span class="k">async def</span> <span class="fn">collect</span>(self, device_id, window) -> Batch: ...
+    <span class="k">def</span> <span class="fn">status</span>(self) -> dict: ...
+<span class="c"># Batch carries the verdict: attested / integrity / measurement_ok</span></code></pre>
+
+  <h3>Recency-weighted average</h3>
+  <pre><code><span class="c"># processing.py — newer samples weigh more (weight grows with timestamp)</span>
+<span class="k">for</span> s <span class="k">in</span> samples:
+    w = (s.ts - ts_min) + step
+    num += w * s.value ; den += w
+<span class="k">return</span> num / den</code></pre>
+
+  <!-- 7 -->
+  <h2 id="chart">7 · Aggregations illustrated</h2>
+  <p>Synthetic samples over the last hour and what each aggregation returns. The weighted average sits
+  above the plain mean because recent samples trend higher.</p>
+  <figure>
+    <div class="diagram">
+    <svg viewBox="0 0 640 240" role="img" aria-label="Sample data with aggregations">
+      <!-- axes -->
+      <line x1="50" y1="200" x2="610" y2="200" stroke="#27324a"/>
+      <line x1="50" y1="30" x2="50" y2="200" stroke="#27324a"/>
+      <text x="30" y="204" fill="#93a0b8" font-size="10">20</text>
+      <text x="30" y="120" fill="#93a0b8" font-size="10">25</text>
+      <text x="30" y="40"  fill="#93a0b8" font-size="10">30</text>
+      <text x="330" y="228" fill="#93a0b8" font-size="11" text-anchor="middle">time (last hour) →</text>
+      <!-- sample polyline (values rising with noise) -->
+      <polyline fill="none" stroke="#4c8dff" stroke-width="2"
+        points="50,150 106,158 162,140 218,132 274,120 330,124 386,108 442,100 498,92 554,96 610,84"/>
+      <!-- points -->
+      <g fill="#4c8dff">
+        <circle cx="50" cy="150" r="3"/><circle cx="162" cy="140" r="3"/><circle cx="274" cy="120" r="3"/>
+        <circle cx="386" cy="108" r="3"/><circle cx="498" cy="92" r="3"/><circle cx="610" cy="84" r="3"/>
+      </g>
+      <!-- mean line -->
+      <line x1="50" y1="120" x2="610" y2="120" stroke="#93a0b8" stroke-dasharray="6 4"/>
+      <text x="614" y="122" fill="#93a0b8" font-size="10">mean</text>
+      <!-- weighted avg line (higher = lower y) -->
+      <line x1="50" y1="106" x2="610" y2="106" stroke="#2fbf71" stroke-width="2"/>
+      <text x="500" y="100" fill="#2fbf71" font-size="10">weighted avg</text>
+      <!-- min/max ticks -->
+      <line x1="610" y1="84" x2="620" y2="84" stroke="#e8b13b"/><text x="614" y="76" fill="#e8b13b" font-size="10">max</text>
+    </svg>
+    </div>
+    <figcaption>Blue = samples · grey dashed = mean · green = recency-weighted average.</figcaption>
+  </figure>
+
+  <!-- 8 -->
+  <h2 id="run">8 · How to run</h2>
+  <pre><code>python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r server/requirements.txt
+
+<span class="c"># TLS 1.3 (default)</span>
+python -m server.main --security tls       <span class="c"># https://localhost:8000</span>
+
+<span class="c"># application-layer AES-256-GCM</span>
+python -m server.main --security aesgcm     <span class="c"># http://localhost:8000</span>
+
+python -m pytest server/tests -q             <span class="c"># unit + E2E, both modes</span></code></pre>
+  <p class="muted"><strong>Security notes.</strong> The TLS cert is self-signed → a one-time local browser
+  warning; the context is TLS-1.3-only. In AES-GCM mode the browser uses WebCrypto (allowed on
+  <code>http://localhost</code>); request/response bodies are <code>{iv, ct}</code> — open devtools →
+  Network to see only ciphertext. All configuration comes from <code>config.Config</code>
+  (<code>MS_*</code> env vars).</p>
+
+  <footer>
+    Management Server · User↔Server side · Group 4 — Confidential Computing.
+    This page is self-contained (no external assets).
+  </footer>
+</div>
+</body>
+</html>
