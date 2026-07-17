@@ -135,3 +135,38 @@ Along the way we also hit a **real gotcha worth remembering** if you reproduce t
 server loads the guest list into memory once when it starts and never re-reads the file — so
 editing `device_registry.json` by hand while the server is still running has no effect until you
 restart it.
+
+---
+
+## 6. The flip side: re-provisioning a device for a "fresh device" test
+
+§4 explained the design choice — no admin token, no force flag; whoever can edit
+`device_registry.json` on disk *is* the admin. In practice that means: if you deliberately want a
+`device_id` to be treated as brand-new again (most commonly when testing self-registration itself,
+by wiping a QEMU instance's persisted-AK disk with `rm -f .device-state/iot-edge-NN.img` to force a
+fresh Attestation Key), the registry still has that `device_id`'s *old* key in it. Scenario B above
+is exactly what then happens to your own test: the fresh device's self-registration POST carries a
+new key for an already-known ID, gets `409 DeviceKeyMismatch`, and the device is stuck printing
+`attestation/session failed; retrying` forever — because it was never actually enrolled under its
+new key.
+
+This isn't a QEMU/build cache problem, even though it looks like one — it's the server-side
+registry entry outliving the device-side state you reset.
+
+**Fix:** `scripts/reset-device-registry.sh` is the scripted version of "edit the file by hand":
+
+```bash
+scripts/reset-device-registry.sh --list                 # see what's currently enrolled
+scripts/reset-device-registry.sh iot-edge-10             # drop one stale entry
+scripts/reset-device-registry.sh iot-edge-10 iot-edge-11 # drop several
+scripts/reset-device-registry.sh --all                   # wipe the whole registry
+```
+
+It shells out to `python -m server.reset_registry` (`CC_Server/server/reset_registry.py`), which
+uses the same `DeviceRegistry.remove()`/`.clear()` methods (atomic write, `chmod 0600` preserved) as
+normal registration — not a hand-rolled JSON edit. Respects `MS_DEVICE_REGISTRY_PATH` like the
+server itself does.
+
+**The reload gotcha from §5 still applies**: if CC_Server is already running, restart it after
+running this script — it won't pick up the change otherwise. The script prints a reminder of this
+every time it removes something.

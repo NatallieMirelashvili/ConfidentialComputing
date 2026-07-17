@@ -131,6 +131,28 @@ class DeviceRegistry:
         with self._lock:
             return list(self._records.values())
 
+    def remove(self, device_id: str) -> bool:
+        """Delete one enrolled device. Returns False if it wasn't enrolled.
+
+        The deliberate admin escape hatch for the trade-off documented on
+        register(): normal registration can never overwrite an existing
+        entry, so re-provisioning a device under a new key (e.g. after
+        wiping its persisted AK for a fresh-device test) means removing its
+        old entry here first. See scripts/reset-device-registry.sh.
+        """
+        with self._lock:
+            if device_id not in self._records:
+                return False
+            del self._records[device_id]
+            self._save()
+            return True
+
+    def clear(self) -> None:
+        """Delete every enrolled device."""
+        with self._lock:
+            self._records = {}
+            self._save()
+
 
 _REGISTRY: DeviceRegistry | None = None
 
