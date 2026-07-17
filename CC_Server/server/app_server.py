@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import constants as C
+from .device_link import DeviceLink
 from .device_registry import DeviceKeyMismatch, get_device_registry
 from .service import CollectionService
 from .transport import UserChannel, get_user_channel
@@ -26,22 +27,24 @@ _WEB_DIR = os.path.join(os.path.dirname(__file__), "web")
 _logger = logging.getLogger(__name__)
 
 
-def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
+def create_app(mode: str, device_link: DeviceLink | None = None) -> tuple[FastAPI, UserChannel]:
     """Build the FastAPI app for a given security mode.
 
     Called once at startup. Creates the singletons (channel + service), registers
     the routes, mounts the static UI, and lets the transport wire itself in.
 
     Args:
-        mode: "tls" or "aesgcm" (validated by `get_user_channel`).
+        mode: "tls" (validated by `get_user_channel`; the only mode today).
+        device_link: explicit data source (e.g. a shared link reused across
+            tests). Defaults to CONFIG.device_link's real link if omitted.
 
     Returns:
         (app, channel) — the ASGI app and the chosen UserChannel (main.py needs
         the channel to fetch its SSL context).
     """
     app = FastAPI(title="Trusted IoT — Management Server", version="0.2.0")
-    channel = get_user_channel(mode)     # TLS or AES-GCM transport (singleton)
-    service = CollectionService()        # business logic + shared store (singleton)
+    channel = get_user_channel(mode)     # transport security (singleton)
+    service = CollectionService(device_link=device_link)  # business logic + shared store
 
     # Serve the browser UI (index.html, app.js, styles.css) under /web.
     app.mount("/web", StaticFiles(directory=_WEB_DIR), name="web")
@@ -52,7 +55,6 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
         return FileResponse(os.path.join(_WEB_DIR, "index.html"))
 
     # ---- clear (bootstrap/transport) endpoints ---------------------------
-    # These stay in cleartext even in AES-GCM mode (see constants.CLEAR_PATHS).
     @app.get("/api/health")
     async def health():
         """Liveness probe."""
@@ -64,8 +66,6 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
         return channel.describe()
 
     # ---- secured (app) endpoints -----------------------------------------
-    # In AES-GCM mode these bodies are transparently decrypted/encrypted by the
-    # middleware; the handlers themselves only ever see plain JSON.
     @app.get("/api/devices")
     async def devices():
         """List known devices + their status (for the UI dropdown)."""
@@ -75,9 +75,9 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
     async def register_device(request: Request):
         """Device enrollment: submit a device's attestation identity
         (produced once by scripts/provision-device.sh) so it's allowed to
-        complete remote attestation. Gated behind this same authenticated
-        channel (TLS or AES-GCM) - never exposed on the device-facing TCP
-        port, which has no authentication at all.
+        complete remote attestation. Gated behind this same TLS-protected
+        channel - never exposed on the device-facing TCP port, which has no
+        authentication at all.
 
         Self-service and idempotent, not admin-gated: an unseen device_id is
         enrolled; a resubmission with the same key is a no-op ("already
@@ -135,10 +135,9 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
         """Live feed: repeats POST /api/collect on a timer over one socket.
 
         Params (query string, same names/defaults as /api/collect's body):
-        device_id, window, aggregation. Not covered by the AES-GCM app-layer
-        transport (that middleware only wraps ASGI "http" scopes) - fine here,
-        since this only ever carries the same non-secret trust/result data
-        /api/collect already returns in the clear over TLS.
+        device_id, window, aggregation. Carries the same trust/result data
+        /api/collect returns, protected the same way: TLS at the transport
+        layer.
         """
         await websocket.accept()
         q = websocket.query_params
@@ -172,8 +171,9 @@ def create_app(mode: str) -> tuple[FastAPI, UserChannel]:
             pass
 
     # ---- let the transport mode wire itself in ---------------------------
-    # TLS: no-op. AES-GCM: registers POST /api/handshake + the envelope
-    # middleware. Done last so the middleware wraps all routes above.
+    # TLS: no-op today; kept so a future app-layer mode can register its own
+    # routes/middleware here without touching the routes above. Done last so
+    # any such middleware would wrap all routes above.
     channel.install(app)
 
     return app, channel

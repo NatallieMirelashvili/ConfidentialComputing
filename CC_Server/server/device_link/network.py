@@ -1,10 +1,9 @@
-"""NetworkDeviceLink — receive sensor data pushed by a (real or mock) edge device.
+"""NetworkDeviceLink — receive sensor data pushed by a real edge device.
 
 This is the device-facing side of the Management Server. It runs a small TCP
 server on a background thread; an edge device connects and pushes sensor samples,
 which are buffered per device. `collect()` then hands the newly received samples
-to the app (store -> processing -> UI), exactly like the stub did — only now the
-data comes from the network instead of being fabricated.
+to the app (store -> processing -> UI).
 
 Wire protocol (newline-delimited JSON, device -> server):
 

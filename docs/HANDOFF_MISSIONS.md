@@ -62,9 +62,25 @@ reading → UI "collect" reads the buffer and shows the trust verdict.
 - **Where:** every file/knob is listed in that handoff (§4–5); the one acceptance
   test that matters is its §6 (reboot → attest without re-registering).
 
-### 2.1.b — The UI's attestation/encryption status is a stub by default; needs real data + stress tests
+### 2.1.b — The UI's attestation/encryption status is a stub by default; needs real data + stress tests — **RESOLVED (stub removed 2026-07-17), stress tests still open**
 
-- **Problem:** the server defaults to `MS_DEVICE_LINK=stub` (`CC_Server/server/config.py`),
+- **Resolution:** `StubDeviceLink` and `MS_DEVICE_LINK=stub` no longer exist —
+  `CC_Server/server/device_link/stub.py` is deleted, `constants.DEVICE_LINK_STUB`
+  is gone, and `get_device_link()` now raises at startup unless `MS_DEVICE_LINK`
+  is explicitly `network` or `attested_network`. There is no synthetic fallback
+  left to mask the real verdict, so solution steps 1 and 3 below no longer need
+  doing — they're structurally impossible to get wrong now. `create_app()` gained
+  an optional `device_link` param so callers (tests) can inject a real link
+  instance. `CC_Server/server/tests/test_poc.py`'s E2E tests now require a live
+  attested edge device (QEMU or hardware) and skip if none is connected — no
+  code path exercises the fabricated-verdict behavior anymore.
+- **Still open:** solution step 2 — dedicated **stress tests** against the
+  AES-256-GCM sensor path (high volume, replay, out-of-order/renumbered `seq`,
+  tampered ciphertext/tag under load). `test_attestation.py` already covers the
+  correctness of each of these individually; what's missing is volume/stress,
+  not correctness.
+- **Original problem (for context):** the server used to default to
+  `MS_DEVICE_LINK=stub` (`CC_Server/server/config.py`),
   and the stub link fabricates everything — it hardcodes `attested=True,
   integrity="ok", measurement_ok=True` and synthetic sensor samples
   (`CC_Server/server/device_link/stub.py`, docstring: "synthetic, always-attested

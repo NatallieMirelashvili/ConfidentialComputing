@@ -31,7 +31,6 @@ header .sub { margin: 2px 0 12px; color: var(--muted); }
   font-size: .82rem; font-weight: 600; border: 1px solid var(--border);
 }
 .secbadge.tls { background: rgba(47,191,113,.14); color: var(--ok); border-color: rgba(47,191,113,.4); }
-.secbadge.aesgcm { background: rgba(76,141,255,.14); color: var(--accent); border-color: rgba(76,141,255,.4); }
 .secbadge.unknown { background: var(--card2); color: var(--muted); }
 
 .card {

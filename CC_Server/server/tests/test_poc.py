@@ -1,14 +1,17 @@
-"""PoC tests: crypto building blocks, processing, and full E2E in BOTH transport
-security modes (TLS via ASGI, and application-layer AES-GCM including a tamper
-rejection).
+"""PoC tests: crypto building blocks, processing, and a full E2E pass over the
+User<->Server API in TLS mode (via ASGI).
+
+The E2E tests need a real, attested edge device (QEMU or hardware) pushing
+data for `constants.DEFAULT_DEVICE_ID` over `attested_network` — there is no
+synthetic stub anymore. Start one before running these tests (see
+docs/runtime.html); otherwise they're skipped.
 
 Run:  python -m pytest server/tests -q     (from the project root)
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,12 +19,38 @@ from fastapi.testclient import TestClient
 from server import constants as C
 from server import crypto, processing
 from server.app_server import create_app
+from server.config import CONFIG
+from server.device_link.attested_network import AttestedNetworkDeviceLink
 from server.device_link.base import Sample
-from server.device_link.stub import StubDeviceLink
+
+_DEVICE_WAIT_SECONDS = 15.0
+
+
+@pytest.fixture(scope="module")
+def device_link():
+    """A live AttestedNetworkDeviceLink, shared across every E2E test in this
+    module (one TCP listener bound to CONFIG.device_port — a fresh one per
+    test would fail to rebind the port).
+
+    Skips the whole module if no real device attests for DEFAULT_DEVICE_ID
+    within _DEVICE_WAIT_SECONDS.
+    """
+    link = AttestedNetworkDeviceLink()
+    deadline = time.monotonic() + _DEVICE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        devices = link.status()["devices"]
+        if any(d["device_id"] == C.DEFAULT_DEVICE_ID and d["attested"] for d in devices):
+            return link
+        time.sleep(0.5)
+    pytest.skip(
+        "no attested edge device connected on "
+        f"{CONFIG.device_host}:{CONFIG.device_port} for device_id={C.DEFAULT_DEVICE_ID} "
+        "- start a real/QEMU edge device before running the E2E tests"
+    )
 
 
 # --------------------------------------------------------------------------
-# crypto primitives (user-side essentials)
+# crypto primitives (shared with the Device<->Server attested channel)
 # --------------------------------------------------------------------------
 def test_aead_roundtrip_and_tamper():
     """AES-GCM decrypts what it encrypted, and rejects a flipped bit (InvalidTag)."""
@@ -60,25 +89,12 @@ def test_mean_and_empty():
     assert processing.aggregate([], "mean")["value"] is None
 
 
-def test_stub_link_attested():
-    """The stub returns a good verdict + non-empty samples for a normal device."""
-    batch = asyncio.run(StubDeviceLink().collect(C.DEFAULT_DEVICE_ID, "1h"))
-    assert batch.attested and batch.integrity == "ok"
-    assert len(batch.samples) > 0
-
-
-def test_stub_link_simulated_failure():
-    """A 'tampered' device id yields the failed (rejected) verdict."""
-    batch = asyncio.run(StubDeviceLink().collect("tampered-dev", "1h"))
-    assert not batch.attested and batch.integrity == "fail"
-
-
 # --------------------------------------------------------------------------
 # E2E — TLS mode (ASGI level; endpoints are plain JSON)
 # --------------------------------------------------------------------------
-def test_e2e_tls_mode():
+def test_e2e_tls_mode(device_link):
     """TLS mode: /security reports tls, and a collect returns an attested result."""
-    app, _ = create_app(C.USER_SECURITY_TLS)
+    app, _ = create_app(C.USER_SECURITY_TLS, device_link=device_link)
     client = TestClient(app)
 
     assert client.get("/api/security").json()["mode"] == "tls"
@@ -94,11 +110,11 @@ def test_e2e_tls_mode():
     assert r["n_samples"] > 0
 
 
-def test_ws_collect_live_feed():
+def test_ws_collect_live_feed(device_link):
     """/ws/collect pushes a fresh collect result automatically, on a timer,
     over one socket - same shape /api/collect returns, no client request needed
     per frame."""
-    app, _ = create_app(C.USER_SECURITY_TLS)
+    app, _ = create_app(C.USER_SECURITY_TLS, device_link=device_link)
     client = TestClient(app)
 
     with client.websocket_connect(
@@ -112,73 +128,3 @@ def test_ws_collect_live_feed():
 
         second = ws.receive_json()  # proves the server loop ticks again on its own
         assert second["device_id"] == C.DEFAULT_DEVICE_ID
-
-
-# --------------------------------------------------------------------------
-# E2E — AES-GCM app-layer mode (emulate the browser in Python)
-# --------------------------------------------------------------------------
-def _aesgcm_client():
-    """Build an AES-GCM app, do the ECDH handshake, return (client, sid, key).
-
-    This mirrors what web/app.js does in the browser, but in Python.
-    """
-    app, _ = create_app(C.USER_SECURITY_AESGCM)
-    client = TestClient(app)
-
-    # 1) handshake (cleartext)
-    priv, client_pub = crypto.p256_generate()
-    hs = client.post("/api/handshake", json={"client_pub": crypto.b64e(client_pub)}).json()
-    sid = hs["session_id"]
-    server_pub = crypto.b64d(hs["server_pub"])
-    shared = crypto.p256_shared(priv, server_pub)
-    key = crypto.hkdf(shared, salt=client_pub + server_pub, info=C.INFO_USER_AEAD)
-    return client, sid, key
-
-
-def _seal(key, obj):
-    """Encrypt a dict into an {iv, ct} envelope (what the browser sends)."""
-    iv = crypto.random_bytes(12)
-    ct = crypto.aead_encrypt(key, iv, json.dumps(obj).encode(), b"")
-    return {"iv": crypto.b64e(iv), "ct": crypto.b64e(ct)}
-
-
-def _open(key, env):
-    """Decrypt an {iv, ct} envelope back into a dict (what the browser does)."""
-    return json.loads(crypto.aead_decrypt(key, crypto.b64d(env["iv"]), crypto.b64d(env["ct"]), b""))
-
-
-def test_e2e_aesgcm_mode():
-    """AES-GCM mode: an enveloped collect round-trips and returns an attested result."""
-    client, sid, key = _aesgcm_client()
-
-    # security endpoint is cleartext
-    assert client.get("/api/security").json()["mode"] == "aesgcm"
-
-    # secured collect via encrypted envelope
-    env = _seal(key, {"device_id": C.DEFAULT_DEVICE_ID, "window": "1h", "aggregation": "mean"})
-    resp = client.post("/api/collect", json=env, headers={"X-Session-Id": sid})
-    assert resp.status_code == 200
-    out = _open(key, resp.json())
-    assert out["attested"] is True
-    assert out["result"]["kind"] == "mean"
-
-
-def test_e2e_aesgcm_requires_session():
-    """A secured request without a session header is rejected (401)."""
-    client, _sid, key = _aesgcm_client()
-    env = _seal(key, {"window": "1h"})
-    # no X-Session-Id header -> rejected
-    assert client.post("/api/collect", json=env).status_code == 401
-
-
-def test_e2e_aesgcm_tamper_rejected():
-    """A tampered envelope fails AEAD auth and is rejected (400)."""
-    client, sid, key = _aesgcm_client()
-    env = _seal(key, {"device_id": C.DEFAULT_DEVICE_ID, "window": "1h", "aggregation": "mean"})
-
-    ct = bytearray(crypto.b64d(env["ct"]))
-    ct[0] ^= 0x01  # flip a ciphertext byte
-    env["ct"] = crypto.b64e(bytes(ct))
-
-    resp = client.post("/api/collect", json=env, headers={"X-Session-Id": sid})
-    assert resp.status_code == 400  # AEAD auth failure -> request rejected

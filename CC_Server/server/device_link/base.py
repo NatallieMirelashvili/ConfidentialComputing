@@ -1,7 +1,7 @@
 """The DeviceLink interface and the data types crossing the seam.
 
 The user-facing code consumes a `DeviceLink` to obtain sensor data; the data
-source (here, the stub) implements it.
+source (a real edge device, over `network` or `attested_network`) implements it.
 """
 
 from __future__ import annotations
@@ -29,8 +29,7 @@ class Batch:
     """One collection result handed back to the user side.
 
     `attested`/`integrity`/`measurement_ok` are the *verification verdict* shown
-    in the UI as trust chips. With the stub they are always good (except the
-    `tampered` demo device).
+    in the UI as trust chips, set by the real DeviceLink from remote attestation.
     """
 
     device_id: str

@@ -1,15 +1,18 @@
 # Management Server — User↔Server side (PoC)
 
 Confidential Computing project (Group 4) — the **user-facing** half of the
-Management Server: an HTML UI + REST API, with **selectable transport security**
-for the User↔Server channel (**TLS 1.3** or **application-layer AES-256-GCM**).
+Management Server: an HTML UI + REST API, protected by **TLS 1.3** for the
+User↔Server channel. Transport security is pluggable (`UserChannel`); TLS is
+the only mode implemented today.
 
-Sensor data reaches the server through the **`DeviceLink` seam** — here a
-synthetic **stub**. The real Server↔Device link is a separate part of the project
-and is not included in this (User↔Server) codebase.
+Sensor data reaches the server through the **`DeviceLink` seam**, backed by a
+real edge device over TCP — either `network` (plaintext, self-reported
+attestation) or `attested_network` (remote attestation + AES-256-GCM sensor
+channel). There is no synthetic fallback: `MS_DEVICE_LINK` must select one or
+the server refuses to start.
 
 > **Visual docs** (open in a browser):
-> - `docs/architecture.html` — structure: both transport modes, the data-flow, module/class map.
+> - `docs/architecture.html` — structure: transport security, the data-flow, module/class map.
 > - `docs/runtime.html` — function-level trace of what runs when you open the server,
 >   click Collect, and get the response (sequence diagrams, call graph, object lifetimes).
 
@@ -20,13 +23,13 @@ constants.py     pure constants (modes, crypto params, windows, aggregations)
 main.py          runner: pick the security mode, start uvicorn
 app_server.py    thin FastAPI app: UI + REST routes (transport-agnostic)
 service.py       CollectionService — business logic (DeviceLink → store → processing)
-transport/       TLS 1.3 and AES-GCM modules (swappable) — the two channel options
-crypto.py        user-side crypto (P-256 ECDH, HKDF, AES-GCM) for AES-GCM mode
+transport/       TLS 1.3 module (pluggable UserChannel; only mode today)
+crypto.py        shared crypto (P-256 ECDH, HKDF, AES-GCM) for the Device<->Server channel
 store.py         in-memory sample store        processing.py  aggregations
-web/             the HTML/JS/CSS UI (WebCrypto for AES-GCM mode)
-device_link/     data-source seam: DeviceLink interface + synthetic stub
+web/             the HTML/JS/CSS UI
+device_link/     data-source seam: DeviceLink interface + network/attested_network links
 docs/            architecture.html — visual docs
-tests/           unit + E2E (both modes, incl. tamper rejection)
+tests/           unit + E2E
 ```
 
 ## Run it (Windows, pure Python — no WSL)
@@ -36,39 +39,36 @@ python -m venv .venv
 pip install -r server/requirements.txt
 ```
 
-**Option A — TLS 1.3 (default):**
+`MS_DEVICE_LINK` is required — there's no synthetic fallback, so the server
+refuses to start without it:
 ```powershell
+$env:MS_DEVICE_LINK = "attested_network"    # or "network"; see device_link/README.md
 python -m server.main --security tls
 # open https://localhost:8000  (accept the self-signed cert once)
 ```
 
-**Option B — application-layer AES-256-GCM:**
-```powershell
-python -m server.main --security aesgcm
-# open http://localhost:8000  (browser auto-does the ECDH handshake)
-```
-
 Then in the UI: pick a device, **Last hour**, **Weighted average**, click
 **Collect** → you get the value plus the verification verdict
-(`attested / integrity / measurement`). In AES-GCM mode, open devtools → Network
-and confirm request/response bodies are just `{iv, ct}` (ciphertext on the wire).
-
-> Demo the "rejected" verdict without the real device: the stub treats any
-> `device_id` containing `tampered` as a failed attestation.
+(`attested / integrity / measurement`). This needs a real edge device
+(QEMU or hardware) pushing data — see `docs/ATTESTATION_TESTING.md` to run
+one end-to-end.
 
 ## Tests
 ```powershell
 python -m pytest server/tests -q     # run from the project root (the -m matters)
 ```
-Covers AEAD roundtrip + tamper, P-256 ECDH agreement, weighted-average, the stub
-link, and full E2E in both TLS and AES-GCM modes (including a tampered-envelope
-rejection → HTTP 400).
+Covers AEAD roundtrip + tamper, P-256 ECDH agreement, weighted-average, the
+attestation protocol (simulated device identity, no hardware needed), and a
+full E2E pass in TLS mode. The E2E tests need a real attested edge device
+(QEMU or hardware) connected — they're skipped otherwise.
 
 ## Choosing / adding a transport
-`--security {tls|aesgcm}` (or env `MS_USER_SECURITY`). Each mode is a separate
-module under `transport/` behind the `UserChannel` interface, so adding a new one
-(e.g. mutual-TLS) is a new file + one line in `transport/__init__.py`.
+`--security tls` (or env `MS_USER_SECURITY`) — TLS is the only mode
+implemented today. Each mode is a separate module under `transport/` behind
+the `UserChannel` interface, so adding a new one (e.g. mutual-TLS, or an
+app-layer AEAD mode) is a new file + one branch in `transport/__init__.py`.
 
 ## Device data source
-Sensor data comes from `StubDeviceLink` (`device_link/`) via the `DeviceLink`
-seam. The real Server↔Device link is out of scope for this codebase.
+Sensor data comes from a real edge device via the `DeviceLink` seam
+(`device_link/`) — `NetworkDeviceLink` or `AttestedNetworkDeviceLink`,
+selected by `MS_DEVICE_LINK`. See `device_link/README.md`.

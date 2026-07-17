@@ -1,12 +1,13 @@
-"""Crypto primitives used by the User <-> Server channel (AES-GCM mode).
+"""Shared crypto primitives: P-256 ECDH, HKDF-SHA256, AES-256-GCM, base64/random
+helpers, built on the `cryptography` library.
 
-Thin wrappers over the `cryptography` library. Only what `transport/aesgcm.py`
-needs: P-256 ECDH (to match the browser's WebCrypto), HKDF-SHA256, AES-256-GCM,
-and base64 / random helpers. (TLS mode does NOT use this file at all.)
+Used by the Device <-> Server remote-attestation + encrypted sensor channel
+(`attestation.py`, `device_link/attested_network.py`). The User <-> Server side
+is plain TLS 1.3 (uvicorn + SSLContext) and does not use this file.
 
 How the pieces build AES-GCM, in order:
-    1. p256_generate + p256_shared  -> a shared secret agreed with the browser (ECDH)
-    2. hkdf(shared, ...)            -> turns that secret into the 32-byte AES-256 key
+    1. p256_generate + p256_shared -> a shared secret agreed via ECDH
+    2. hkdf(shared, ...)           -> turns that secret into the 32-byte AES-256 key
     3. random_bytes(12)            -> a fresh unique nonce for each message
     4. aead_encrypt / aead_decrypt -> the actual AES-256-GCM (confidentiality + tag)
     b64e / b64d wrap the binary fields (keys, nonce, ciphertext) for JSON transport.
@@ -42,16 +43,15 @@ def random_bytes(n: int) -> bytes:
     return os.urandom(n)
 
 
-# --- P-256 ECDH (key exchange with the browser via WebCrypto) -------------
-# WebCrypto widely supports ECDH on P-256 (secp256r1). Public keys are the
-# 65-byte uncompressed SEC1 point (0x04 || X || Y), exactly what WebCrypto's
-# exportKey("raw") returns. The ECDH shared secret is the 32-byte X coordinate,
-# which matches WebCrypto's deriveBits output.
+# --- P-256 ECDH (key exchange with the edge device) ------------------------
+# Public keys are the 65-byte uncompressed SEC1 point (0x04 || X || Y) — see
+# DEVICE_ECDH_PUBKEY_LEN and edge_device/ta's own ECDH keypair generation.
+# The ECDH shared secret is the 32-byte X coordinate.
 def p256_generate() -> tuple[ec.EllipticCurvePrivateKey, bytes]:
     """Generate an ephemeral P-256 keypair.
 
     Returns (private_key, public_bytes) where public_bytes is the 65-byte
-    uncompressed SEC1 point the browser expects.
+    uncompressed SEC1 point the device expects.
     """
     priv = ec.generate_private_key(ec.SECP256R1())
     pub_raw = priv.public_key().public_bytes(

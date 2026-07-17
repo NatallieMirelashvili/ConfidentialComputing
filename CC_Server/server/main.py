@@ -1,7 +1,6 @@
 """Entry point: choose the User<->Server security mode and run the server.
 
-    python -m server.main --security tls       # HTTPS, TLS 1.3 (default)
-    python -m server.main --security aesgcm    # HTTP + application-layer AES-GCM
+    python -m server.main --security tls       # HTTPS, TLS 1.3 (default, only mode today)
 
 Env overrides: MS_USER_SECURITY, MS_API_HOST, MS_API_PORT, MS_CERTS_DIR.
 """
@@ -42,7 +41,7 @@ def main() -> None:
 
     # --- 3. build the app + get the transport's SSL context ------------------
     # create_app wires the whole server for this mode; ssl_ctx is a real context
-    # in TLS mode and None in AES-GCM mode.
+    # in TLS mode (None for any future app-layer mode that skips transport TLS).
     app, channel = create_app(args.security)
     ssl_ctx = channel.ssl_context()
 
