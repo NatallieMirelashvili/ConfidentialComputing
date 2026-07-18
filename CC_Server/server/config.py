@@ -76,6 +76,17 @@ class Config:
         """Full path to the TLS private-key file (used only in TLS mode)."""
         return os.path.join(self.certs_dir, "server_key.pem")
 
+    @property
+    def server_identity_key_path(self) -> str:
+        """Full path to the device-facing server-identity ECDSA P-256 key.
+
+        Distinct from the RSA TLS key above: this one is signed with per
+        session so devices can pin the server's identity (TOFU) - see
+        docs/HANDOFF_serverAuthentication.md. Reuses certs_dir so it persists
+        in the same server-certs volume as the TLS key.
+        """
+        return os.path.join(self.certs_dir, "server_identity_key.pem")
+
 
 #: Process-wide configuration, read once from the environment at import time.
 #: Import this (`from .config import CONFIG`) instead of reading os.environ.

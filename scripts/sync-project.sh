@@ -67,4 +67,57 @@ if [[ -f "$QEMU_V8_MK" ]] && ! grep -q 'CFG_CORE_TPM_EVENT_LOG=y' "$QEMU_V8_MK";
   sed -i '/^OPTEE_OS_COMMON_FLAGS += DEBUG=\$(DEBUG) CFG_ARM_GICV3=\$(GICV3)/a OPTEE_OS_COMMON_FLAGS += CFG_DT=y CFG_CORE_TPM_EVENT_LOG=y' "$QEMU_V8_MK"
 fi
 
+# 3rd QEMU serial backend for the confidential_iot sensor_link PTA's secure
+# UART2 (see project/patches/virt-uart2.patch): serial_hd(0)/(1) already map
+# to NW/SW consoles positionally, so a 3rd `-serial` arg becomes serial_hd(2)
+# - exactly the UART2 QEMU only maps into secure_sysmem. QEMU_SENSOR_PORT
+# mirrors QEMU_GDB_PORT/QEMU_NW_PORT/QEMU_SW_PORT's own override convention.
+# Generated build repo file, so re-apply on every sync, idempotently.
+if [[ -f "$QEMU_V8_MK" ]] && ! grep -q '^QEMU_SENSOR_PORT ?= 54322' "$QEMU_V8_MK"; then
+  sed -i '/^QEMU_GDB_PORT ?= 1234/i QEMU_SENSOR_PORT ?= 54322' "$QEMU_V8_MK"
+  sed -i 's/-serial tcp:127.0.0.1:\$(QEMU_SW_PORT) /-serial tcp:127.0.0.1:$(QEMU_SW_PORT) -serial tcp:127.0.0.1:$(QEMU_SENSOR_PORT) /' "$QEMU_V8_MK"
+fi
+
+# Apply the confidential_iot sensor_link PTA's secure UART2 QEMU machine-model
+# patch (VIRT_UART2: new secure-only PL011 at 0x090c0000, IRQ SPI 10 - see
+# docs and the patch file itself for rationale). The qemu/ checkout is a real
+# git repo under the git-ignored workspace, so `git apply` with a
+# --reverse --check idempotency guard is more robust here than sed for a
+# multi-line C change: it applies once and is a no-op on every later sync.
+QEMU_SRC="$OPTEE_WORKSPACE/qemu"
+UART2_PATCH="$ROOT_DIR/project/patches/virt-uart2.patch"
+if [[ -d "$QEMU_SRC" && -f "$UART2_PATCH" ]]; then
+  if ! git -C "$QEMU_SRC" apply --reverse --check "$UART2_PATCH" 2>/dev/null; then
+    git -C "$QEMU_SRC" apply "$UART2_PATCH"
+  fi
+fi
+
+# sensor_link PTA: copy the tracked sources into the git-ignored optee_os
+# checkout (plain `cp`, naturally idempotent - unlike the QEMU patch above,
+# these are whole new files with no upstream content to conflict with).
+OPTEE_OS_SRC="$OPTEE_WORKSPACE/optee_os"
+OPTEE_OS_EXT="$ROOT_DIR/project/optee_os_ext"
+if [[ -d "$OPTEE_OS_SRC" && -d "$OPTEE_OS_EXT" ]]; then
+  cp "$OPTEE_OS_EXT/core/pta/sensor_link.c" "$OPTEE_OS_SRC/core/pta/sensor_link.c"
+  cp "$OPTEE_OS_EXT/lib/libutee/include/pta_sensor_link.h" \
+    "$OPTEE_OS_SRC/lib/libutee/include/pta_sensor_link.h"
+
+  # Build it only when explicitly enabled (CFG_SENSOR_LINK_PTA), matching this
+  # sub.mk's existing srcs-$(CFG_*) convention - sensor_link.c hardcodes a
+  # QEMU-virt-specific MMIO address (see the file itself), so it must not be
+  # unconditionally built into every OP-TEE platform.
+  PTA_SUB_MK="$OPTEE_OS_SRC/core/pta/sub.mk"
+  if [[ -f "$PTA_SUB_MK" ]] && ! grep -q 'sensor_link.c' "$PTA_SUB_MK"; then
+    sed -i '/^srcs-\$(CFG_HWRNG_PTA) += hwrng.c/a srcs-$(CFG_SENSOR_LINK_PTA) += sensor_link.c' "$PTA_SUB_MK"
+  fi
+fi
+
+# Enable CFG_SENSOR_LINK_PTA for this project's qemu build (see above for why
+# it's opt-in rather than srcs-y). Generated build repo file, re-apply
+# idempotently, same anchor as the measured-boot CFG_DT/CFG_CORE_TPM_EVENT_LOG
+# patch above.
+if [[ -f "$QEMU_V8_MK" ]] && ! grep -q 'CFG_SENSOR_LINK_PTA=y' "$QEMU_V8_MK"; then
+  sed -i '/^OPTEE_OS_COMMON_FLAGS += DEBUG=\$(DEBUG) CFG_ARM_GICV3=\$(GICV3)/a OPTEE_OS_COMMON_FLAGS += CFG_SENSOR_LINK_PTA=y' "$QEMU_V8_MK"
+fi
+
 echo "Project sources synced into $OPTEE_WORKSPACE/optee_examples"

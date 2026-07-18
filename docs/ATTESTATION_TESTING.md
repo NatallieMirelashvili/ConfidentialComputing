@@ -186,6 +186,18 @@ on first real-hardware run, in order of likelihood:
    `nonce || server_ecdh_pub || device_ecdh_pub` before hashing, and diff
    them — this pins down whether it's a byte-order/encoding mismatch rather
    than a real protocol bug.
+6. **`sensor authentication failed` after re-running the edge binary in the
+   same boot** — expected, not a bug. `optee_example_confidential_iot_edge`
+   is meant to run **once per boot**. The Sensor Module (`sensor_daemon`)
+   streams readings on the shared secure UART once authenticated, and that
+   stream is tied to the QEMU-boot connection, not the edge-process lifetime.
+   Ctrl-C'ing the edge binary and starting it again leaves the previous run's
+   unconsumed reading backlog (and PL011 RX-FIFO overflow) in the link, which
+   desyncs the next challenge/response so `ta_authenticate_sensor` fails
+   closed. **Reboot the guest to re-run the edge client** (a fresh QEMU boot
+   resets the sensor connection). Fixing it in-place would mean draining/
+   resyncing the UART in the Secure-World `sensor_link` PTA — deliberately not
+   done, since one-run-per-boot is the intended flow.
 
 For all of the above, the Python test suite (§1) staying green tells you
 the *server-side logic* is fine — so a real-hardware failure almost always

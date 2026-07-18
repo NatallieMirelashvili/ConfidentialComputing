@@ -17,6 +17,10 @@ CC_Server/server/certs/
 # Per-instance persistent device disk images (see docs/HANDOFF_persistentAK.md)
 .device-state/
 
+# Per-build stamp written by scripts/build.sh; scripts/run-project.sh diffs it
+# to reset a device to a fresh TOFU on rebuild (docs/HANDOFF_serverAuthentication.md)
+.build-stamp
+
 # Google repo metadata and nested upstream git checkouts
 .repo/
 **/.repo/
@@ -57,4 +61,8 @@ compile_commands.json
 *.dtb
 *.cpio
 *.uboot
+
+# sensor_daemon: native, extensionless build output (see
+# project/optee_examples/confidential_iot/sensor_module/Makefile)
+project/optee_examples/confidential_iot/sensor_module/sensor_daemon
 

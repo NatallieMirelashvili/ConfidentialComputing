@@ -20,6 +20,7 @@
 #define CIOT_NONCE_MAX		64
 #define CIOT_ECDH_PUB_SIZE	TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE
 #define CIOT_TRANSCRIPT_HASH_SIZE TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE
+#define CIOT_SERVER_SIG_SIZE	TA_CONFIDENTIAL_IOT_SERVER_SIG_SIZE
 
 /* Local device configuration, set up once by scripts/provision-device.sh
  * and read from /etc/confidential_iot/device.conf (env vars override). */
@@ -38,13 +39,20 @@ static int g_conn_open;
 static uint8_t g_nonce[CIOT_NONCE_MAX];
 static size_t g_nonce_len;
 static uint8_t g_server_ecdh_pub[CIOT_ECDH_PUB_SIZE];
+/* Server-identity material for the device->server authentication (TOFU): the
+ * server's identity public key (from attest_challenge) and its per-session
+ * signature (from attest_result). Cached here across edge_attest_to_server()
+ * and edge_handshake(), which passes both to the TA to verify + pin. See
+ * docs/HANDOFF_serverAuthentication.md. */
+static uint8_t g_server_identity_pub[CIOT_ECDH_PUB_SIZE];
+static uint8_t g_server_sig[CIOT_SERVER_SIG_SIZE];
 static int g_attested;
 /* Monotonic-clock deadline (seconds) after which the current session is
  * treated as expired and the device re-attests. Set from the server's
  * session_ttl in each attest_result. */
 static long g_session_expiry;
-/* Sequence number the TA authenticated for the most recent PROTECT call, set
- * by ta_protect_and_encode() and put on the wire by
+/* Sequence number the TA authenticated for the most recent READ_AND_PROTECT
+ * call, set by ta_read_and_protect_encode() and put on the wire by
  * edge_send_sensor_data_to_server() for the server's anti-replay check. */
 static uint32_t g_last_seq;
 
@@ -147,16 +155,6 @@ void edge_device_shutdown(void)
 #endif
 }
 
-/* Superseded: the mock sensor value now lives inside the TA (see g_mock_value
- * in trusted_app.c) so it is generated in secure world and sealed by AES-GCM.
- * The Host no longer builds the payload; edge_process_sensor_data() drives the
- * TA to produce it. Kept as a stub for the (unused) header contract. */
-int edge_get_sensor_data(char *out, size_t out_size)
-{
-	(void)out; (void)out_size;
-	return 0;
-}
-
 int edge_authenticate_sensor(void)
 {
 #ifndef CONFIDENTIAL_IOT_NATIVE
@@ -167,10 +165,12 @@ int edge_authenticate_sensor(void)
 	if (!g_teec_open)
 		return -1;
 
-	/* Stub command today: no parameters. The TA sets its own
-	 * sensor_authenticated verdict; we only trigger the check. */
+	/* No parameters, by design: the whole HMAC-SHA256 challenge-response
+	 * happens TA<->sensor_link PTA, entirely inside Secure World (see
+	 * ta_authenticate_sensor in trusted_app.c) - the Host only triggers
+	 * it and never sees the challenge or the response. */
 	memset(&op, 0, sizeof(op));
-	op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE, // ************* REMEMBER TO CHANGE THIS IF YOU ADD PARAMETERS(EMILY) ************
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE,
 					  TEEC_NONE, TEEC_NONE);
 
 	res = TEEC_InvokeCommand(&g_teec_sess,
@@ -239,8 +239,13 @@ static int ta_handshake_init(uint8_t out_pub[CIOT_ECDH_PUB_SIZE],
 	return 0;
 }
 
-static int ta_protect_and_encode(const char *input, size_t input_size,
-				 char *output, size_t output_size)
+/*
+ * Trigger the TA's inverted READ_AND_PROTECT command: no plaintext input at
+ * all (the reading is pulled from the sensor_link PTA entirely inside
+ * Secure World - see ta_read_and_protect in trusted_app.c), only the
+ * resulting {nonce, ciphertext-with-tag, seq} ever crosses back to the Host.
+ */
+static int ta_read_and_protect_encode(char *output, size_t output_size)
 {
 	TEEC_Operation op;
 	TEEC_Result res;
@@ -253,44 +258,69 @@ static int ta_protect_and_encode(const char *input, size_t input_size,
 
 	if (!g_teec_open)
 		return -1;
-	if (input_size > sizeof(ciphertext) - 16)
-		return -1;
 
 	memset(&op, 0, sizeof(op));
-	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_OUTPUT,
 					  TEEC_MEMREF_TEMP_OUTPUT,
-					  TEEC_MEMREF_TEMP_OUTPUT,
-					  TEEC_VALUE_OUTPUT);
-	op.params[0].tmpref.buffer = (void *)input;
-	op.params[0].tmpref.size = input_size;
-	op.params[1].tmpref.buffer = nonce;
-	op.params[1].tmpref.size = sizeof(nonce);
-	op.params[2].tmpref.buffer = ciphertext;
-	op.params[2].tmpref.size = sizeof(ciphertext);
+					  TEEC_VALUE_OUTPUT,
+					  TEEC_NONE);
+	op.params[0].tmpref.buffer = nonce;
+	op.params[0].tmpref.size = sizeof(nonce);
+	op.params[1].tmpref.buffer = ciphertext;
+	op.params[1].tmpref.size = sizeof(ciphertext);
 
 	res = TEEC_InvokeCommand(&g_teec_sess,
-				  TA_CONFIDENTIAL_IOT_CMD_PROTECT_SENSOR_DATA,
+				  TA_CONFIDENTIAL_IOT_CMD_READ_AND_PROTECT,
 				  &op, &err_origin);
-	if (res != TEEC_SUCCESS || op.params[1].tmpref.size != sizeof(nonce))
+	if (res != TEEC_SUCCESS || op.params[0].tmpref.size != sizeof(nonce))
 		return -1;
 
 	/* Remember the seq the TA authenticated so the "data" message can carry
 	 * it for the server's inner-session anti-replay check. */
-	g_last_seq = op.params[3].value.a;
+	g_last_seq = op.params[2].value.a;
 
-	combined_len = op.params[1].tmpref.size + op.params[2].tmpref.size;
+	combined_len = op.params[0].tmpref.size + op.params[1].tmpref.size;
 	if (combined_len > sizeof(combined))
 		return -1;
 
-	memcpy(combined, nonce, op.params[1].tmpref.size);
-	memcpy(combined + op.params[1].tmpref.size, ciphertext,
-	       op.params[2].tmpref.size);
+	memcpy(combined, nonce, op.params[0].tmpref.size);
+	memcpy(combined + op.params[0].tmpref.size, ciphertext,
+	       op.params[1].tmpref.size);
 
 	if (mbedtls_base64_encode((unsigned char *)output, output_size, &olen,
 				   combined, combined_len) != 0)
 		return -1;
 
 	return 0;
+}
+
+/*
+ * One-time provisioning trigger for the Sensor Module's pre-shared secret
+ * (see scripts/pair-sensor.sh and ta_provision_sensor_secret in
+ * trusted_app.c). The secret transits this Normal-World buffer once, at
+ * pairing time - an accepted, documented trust assumption inherent to any
+ * shared-secret provisioning step on this emulated platform, distinct from
+ * the ongoing sensor-data path this project's hard requirement is about.
+ */
+int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+{
+	TEEC_Operation op;
+	TEEC_Result res;
+	uint32_t err_origin;
+
+	if (!g_teec_open)
+		return -1;
+
+	memset(&op, 0, sizeof(op));
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
+					  TEEC_NONE, TEEC_NONE);
+	op.params[0].tmpref.buffer = (void *)secret;
+	op.params[0].tmpref.size = TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE;
+
+	res = TEEC_InvokeCommand(&g_teec_sess,
+				  TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET,
+				  &op, &err_origin);
+	return (res == TEEC_SUCCESS) ? 0 : -1;
 }
 
 #else /* CONFIDENTIAL_IOT_NATIVE: no TEE client library available to link */
@@ -302,27 +332,23 @@ static int ta_handshake_init(uint8_t out_pub[CIOT_ECDH_PUB_SIZE],
 	return -1;
 }
 
-static int ta_protect_and_encode(const char *input, size_t input_size,
-				 char *output, size_t output_size)
+static int ta_read_and_protect_encode(char *output, size_t output_size)
 {
-	(void)input; (void)input_size; (void)output; (void)output_size;
+	(void)output; (void)output_size;
+	return -1;
+}
+
+int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+{
+	(void)secret;
 	return -1;
 }
 
 #endif
 
-int edge_call_ta(uint32_t cmd_id, const char *input, size_t input_size,
-		 char *output, size_t output_size)
+int edge_call_ta(char *output, size_t output_size)
 {
-	if (cmd_id == TA_CONFIDENTIAL_IOT_CMD_PROTECT_SENSOR_DATA)
-		return ta_protect_and_encode(input, input_size, output,
-					      output_size);
-
-	/* AUTHENTICATE_SENSOR / PROCESS_SENSOR_DATA belong to the separate
-	 * sensor challenge-response sub-protocol, out of scope here. */
-	 // ****** TODO *****
-	(void)input; (void)input_size; (void)output; (void)output_size;
-	return -1;
+	return ta_read_and_protect_encode(output, output_size);
 }
 
 /* Monotonic seconds, for session-expiry deadlines (immune to wall-clock jumps;
@@ -408,6 +434,20 @@ int edge_attest_to_server(void)
 		cJSON_Delete(msg);
 		return -1;
 	}
+
+	/* Server-identity public key: pinned by the TA on first use, then
+	 * required to match on every later handshake (TOFU). Same 65-byte SEC1
+	 * point encoding as the ECDH keys. */
+	item = cJSON_GetObjectItemCaseSensitive(msg, "server_identity_pub");
+	if (!cJSON_IsString(item) ||
+	    mbedtls_base64_decode(g_server_identity_pub,
+				   sizeof(g_server_identity_pub), &olen,
+				   (const unsigned char *)item->valuestring,
+				   strlen(item->valuestring)) != 0 ||
+	    olen != CIOT_ECDH_PUB_SIZE) {
+		cJSON_Delete(msg);
+		return -1;
+	}
 	cJSON_Delete(msg);
 
 	/* The TA generates the ephemeral keypair and hands back the pubkey
@@ -449,6 +489,23 @@ int edge_attest_to_server(void)
 	 * server omits it, so we never treat the session as valid forever. */
 	g_session_expiry = mono_now() +
 		(cJSON_IsNumber(item) && item->valueint > 0 ? item->valueint : 300);
+	if (ok) {
+		/* On success the server also proves its own identity with a
+		 * signature over this session's transcript; edge_handshake()
+		 * hands it to the TA, which verifies it against the pinned
+		 * server key before deriving the session key. Missing or
+		 * wrong-length => reject before we ever trust the session. */
+		item = cJSON_GetObjectItemCaseSensitive(msg, "server_sig");
+		if (!cJSON_IsString(item) ||
+		    mbedtls_base64_decode(g_server_sig, sizeof(g_server_sig),
+					   &olen,
+					   (const unsigned char *)item->valuestring,
+					   strlen(item->valuestring)) != 0 ||
+		    olen != CIOT_SERVER_SIG_SIZE) {
+			cJSON_Delete(msg);
+			return -1;
+		}
+	}
 	cJSON_Delete(msg);
 	if (!ok)
 		return -1;
@@ -518,31 +575,6 @@ static int edge_register_with_server(void)
 	return 0;
 }
 
-int edge_process_sensor_data(void)
-{
-#ifndef CONFIDENTIAL_IOT_NATIVE
-	TEEC_Operation op;
-	TEEC_Result res;
-	uint32_t err_origin;
-
-	if (!g_teec_open)
-		return -1;
-
-	/* No parameters: the TA produces the reading from its own state (the
-	 * mock counter) and stages it internally for the next PROTECT call. */
-	memset(&op, 0, sizeof(op));
-	op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE,
-					  TEEC_NONE, TEEC_NONE);
-
-	res = TEEC_InvokeCommand(&g_teec_sess,
-				  TA_CONFIDENTIAL_IOT_CMD_PROCESS_SENSOR_DATA,
-				  &op, &err_origin);
-	return (res == TEEC_SUCCESS) ? 0 : -1;
-#else
-	return -1;
-#endif
-}
-
 int edge_ensure_session(void)
 {
 	int rc;
@@ -595,13 +627,21 @@ int edge_handshake(void)
 			return -1;
 
 		memset(&op, 0, sizeof(op));
+		/* params[2]/[3] carry the server-identity pubkey + signature so
+		 * the TA can authenticate the server (verify + TOFU-pin) before
+		 * it derives the session key - see docs/HANDOFF_serverAuthentication.md. */
 		op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
 						  TEEC_MEMREF_TEMP_INPUT,
-						  TEEC_NONE, TEEC_NONE);
+						  TEEC_MEMREF_TEMP_INPUT,
+						  TEEC_MEMREF_TEMP_INPUT);
 		op.params[0].tmpref.buffer = g_server_ecdh_pub;
 		op.params[0].tmpref.size = CIOT_ECDH_PUB_SIZE;
 		op.params[1].tmpref.buffer = g_nonce;
 		op.params[1].tmpref.size = g_nonce_len;
+		op.params[2].tmpref.buffer = g_server_identity_pub;
+		op.params[2].tmpref.size = CIOT_ECDH_PUB_SIZE;
+		op.params[3].tmpref.buffer = g_server_sig;
+		op.params[3].tmpref.size = CIOT_SERVER_SIG_SIZE;
 
 		res = TEEC_InvokeCommand(&g_teec_sess,
 					  TA_CONFIDENTIAL_IOT_CMD_HANDSHAKE_COMPLETE,

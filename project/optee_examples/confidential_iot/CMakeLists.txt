@@ -4,13 +4,10 @@ add_executable(optee_example_confidential_iot_edge
 	edge_device/host/main.c
 	edge_device/host/edge_device.c
 	edge_device/host/net.c
-	sensor_module/sensor_module.c
-	sensor_module/secure_element.c
 	attestation/attestation.c)
 
 target_include_directories(optee_example_confidential_iot_edge
 	PRIVATE edge_device/host
-	PRIVATE sensor_module
 	PRIVATE attestation
 	PRIVATE edge_device/ta/include)
 
@@ -32,3 +29,8 @@ install(PROGRAMS scripts/provision-device.sh
 # scripts/S29tee-storage and docs/HANDOFF_persistentAK.md.
 install(PROGRAMS scripts/S29tee-storage
 	DESTINATION /etc/init.d)
+
+# sensor_module/sensor_daemon.c is intentionally NOT built here: it models a
+# physically separate Sensor Module board and runs OUTSIDE this QEMU guest,
+# on the physical/dev host - see sensor_module/Makefile (a native, non-cross
+# build) and scripts/run-project.sh.

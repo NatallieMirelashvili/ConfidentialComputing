@@ -6,11 +6,9 @@ OBJCOPY ?= $(CROSS_COMPILE)objcopy
 OBJDUMP ?= $(CROSS_COMPILE)objdump
 READELF ?= $(CROSS_COMPILE)readelf
 
-OBJS = main.o edge_device.o net.o \
-       ../../sensor_module/sensor_module.o \
-       ../../sensor_module/secure_element.o ../../attestation/attestation.o
+OBJS = main.o edge_device.o net.o ../../attestation/attestation.o
 
-CFLAGS += -Wall -I. -I../../sensor_module -I../../attestation -I../ta/include
+CFLAGS += -Wall -I. -I../../attestation -I../ta/include
 
 # base64/SHA-256 come from mbedTLS (libmbedcrypto), JSON from cJSON. In the
 # real image build these are provided by the Buildroot packages enabled via

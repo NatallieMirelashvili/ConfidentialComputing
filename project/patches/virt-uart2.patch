@@ -1,0 +1,55 @@
+diff --git a/hw/arm/virt.c b/hw/arm/virt.c
+index a96452f..878e0df 100644
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -183,6 +183,13 @@ static const MemMapEntry base_memmap[] = {
+     [VIRT_NVDIMM_ACPI] =        { 0x09090000, NVDIMM_ACPI_IO_LEN},
+     [VIRT_PVTIME] =             { 0x090a0000, 0x00010000 },
+     [VIRT_SECURE_GPIO] =        { 0x090b0000, 0x00001000 },
++    /*
++     * Secure-only 3rd PL011 UART, added for the confidential_iot project's
++     * sensor_link PTA: a point-to-point "cable" between the emulated Sensor
++     * Module (an external process) and Secure World only. Never reachable
++     * from Normal World - see create_uart()'s secure=true path below.
++     */
++    [VIRT_UART2] =              { 0x090c0000, 0x00001000 },
+     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
+     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
+     [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
+@@ -232,6 +239,7 @@ static const int a15irqmap[] = {
+     [VIRT_GPIO] = 7,
+     [VIRT_UART1] = 8,
+     [VIRT_ACPI_GED] = 9,
++    [VIRT_UART2] = 10,
+     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
+     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
+     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
+@@ -2395,6 +2403,16 @@ static void machvirt_init(MachineState *machine)
+     }
+     create_uart(vms, VIRT_UART0, sysmem, serial_hd(0), false);
+     if (vms->secure) {
++        /*
++         * Create UART2 (confidential_iot's sensor_link PTA UART) before
++         * UART1 so UART1 remains the final /secure-chosen stdout-path -
++         * create_uart() overwrites that property on every secure=true call,
++         * so creation order here is what decides the winner. This preserves
++         * today's behavior (UART1 is OP-TEE's own secure console) even
++         * though neither OP-TEE nor TF-A actually consult /secure-chosen
++         * (they select their console by hardcoded base address).
++         */
++        create_uart(vms, VIRT_UART2, secure_sysmem, serial_hd(2), true);
+         create_uart(vms, VIRT_UART1, secure_sysmem, serial_hd(1), true);
+     }
+ 
+diff --git a/include/hw/arm/virt.h b/include/hw/arm/virt.h
+index c8e94e6..41f1b78 100644
+--- a/include/hw/arm/virt.h
++++ b/include/hw/arm/virt.h
+@@ -75,6 +75,7 @@ enum {
+     VIRT_UART1,
+     VIRT_SECURE_MEM,
+     VIRT_SECURE_GPIO,
++    VIRT_UART2,
+     VIRT_PCDIMM_ACPI,
+     VIRT_ACPI_GED,
+     VIRT_NVDIMM_ACPI,

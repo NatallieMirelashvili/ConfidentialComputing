@@ -28,7 +28,13 @@ project/optee_examples/confidential_iot/
 ├── host/main.c              Normal-World Host app ("edge_device") — CA
 ├── host/edge_device.c       device orchestration: session, attest, send
 ├── host/net.c                raw TCP socket helpers
-└── host/attestation/         fTPM quote/signature generation
+├── attestation/               fTPM quote/signature generation
+└── sensor_module/sensor_daemon.c   Sensor Module companion process (see
+                                     docs/SENSOR_PATH_IMPLEMENTATION.md) —
+                                     runs OUTSIDE the QEMU guest
+
+project/optee_os_ext/core/pta/sensor_link.c   the sensor_link PTA (owns the
+                                                secure UART2, see above)
 
 CC_Server/server/
 ├── app_server.py             FastAPI app — admin/browser API, port 8000
@@ -143,18 +149,21 @@ walkthrough is useful).
   *different* key is rejected (`DeviceKeyMismatch` → HTTP 409), preventing
   silent identity takeover. See `docs/SELF_REGISTRATION_IMPLEMENTATION.md`.
 
-## Known architectural gap (not yet fixed)
+## Sensor path — RESOLVED
 
-Raw sensor plaintext currently passes through the Normal-World Host before
-reaching the TA: `main.c` reads the sensor into a Host buffer
-(`edge_get_sensor_data`), then hands that plaintext to the TA's
-`PROTECT_SENSOR_DATA` command as an input parameter. Nothing leaves the
-device unencrypted (only ciphertext hits the network), but the intended
-trust model — sensor data should originate *inside* the TEE and the Host
-should never see cleartext — isn't met yet. The fix direction (not yet
-implemented, tracked as a peer's task) is a TrustZone-locked secure
-peripheral + pseudo-TA (PTA) + an inverted `READ_AND_PROTECT` command that
-outputs only `{nonce, ciphertext, seq}` with no plaintext input.
+The Host previously saw sensor plaintext (`edge_get_sensor_data` staged it
+in a Host buffer before handing it to `PROTECT_SENSOR_DATA` as an input
+parameter), and `ta_authenticate_sensor` was a stub that always succeeded.
+Both are now real: a secure-only UART2 (Normal-World-invisible, same
+mechanism as OP-TEE's own console UART) connects a new `sensor_link`
+pseudo-TA to an external Sensor Module process (`sensor_daemon`), which
+holds a hardcoded-but-not-compiled-in pre-shared secret. Sensor
+authentication is a real HMAC-SHA256 challenge-response verified inside the
+TA (`TEE_MACCompareFinal`), and the inverted `READ_AND_PROTECT` command has
+no plaintext input parameter at all — the Host CA only ever triggers TA
+commands and receives AES-256-GCM ciphertext back. See
+`docs/SENSOR_PATH_IMPLEMENTATION.md` for the full design and the
+positive/negative-path verification performed.
 
 ## Where to go deeper
 
@@ -165,6 +174,7 @@ outputs only `{nonce, ciphertext, seq}` with no plaintext input.
 | Why the device speaks first in the protocol | `docs/CONNECTION_INITIATION.md` |
 | Remaining work items, owned by whom | `docs/HANDOFF_MISSIONS.md` |
 | AK persistence implementation | `docs/PERSISTENT_AK_IMPLEMENTATION.md` |
+| Sensor path (secure UART + PTA + real HMAC auth) implementation | `docs/SENSOR_PATH_IMPLEMENTATION.md` |
 | QEMU guest networking setup | `docs/QEMU_NETWORKING.md` |
 | Self-registration implementation | `docs/SELF_REGISTRATION_IMPLEMENTATION.md` |
 | Clearing stale registry entries for a fresh-device test | `docs/RESET_DEVICE_REGISTRY.md` |

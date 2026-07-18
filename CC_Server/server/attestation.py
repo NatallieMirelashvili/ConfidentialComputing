@@ -56,12 +56,20 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from . import constants as C
 from . import crypto
+from .config import CONFIG
 from .device_registry import DeviceRegistry, get_device_registry
 
 TPM_GENERATED_VALUE = 0xFF544347
 TPM_ST_ATTEST_QUOTE = 0x8018
 TPM_ALG_SHA256 = 0x000B
 TPM_ALG_ECDSA = 0x0018
+
+# Domain-separation label for the server-identity signature (device pins the
+# server, TOFU - docs/HANDOFF_serverAuthentication.md §4). Distinct from the
+# device's own TPM-quote transcript so the two signatures can never be confused
+# (cross-protocol signature confusion). MUST equal the TA's
+# TA_CONFIDENTIAL_IOT_SERVER_IDENTITY_LABEL byte for byte (no NUL terminator).
+SERVER_IDENTITY_LABEL = b"CC-IOT-1 server-identity"
 
 
 class AttestationError(ValueError):
@@ -100,11 +108,23 @@ class AttestationVerifier:
         # Guards _sessions reads/updates that race across connection threads
         # (notably the anti-replay seq bump in check_and_advance_seq).
         self._lock = threading.Lock()
+        # Server-identity signing key (device pins its public half, TOFU).
+        # Loaded once (generate-if-missing) and held for the process lifetime,
+        # like the TLS context - NEVER regenerated, see ensure_server_identity_key.
+        self._identity_priv = crypto.ensure_server_identity_key(
+            CONFIG.server_identity_key_path
+        )
+        self._identity_pub_raw = crypto.public_point_raw(self._identity_priv)
 
     # -- step 1/2: hello -> attest_challenge --------------------------------
     def issue_challenge(self, device_id: str) -> dict:
         """Raises AttestationError if device_id isn't enrolled. Otherwise
-        returns the {nonce, server_ecdh_pub} dict to send as attest_challenge."""
+        returns the {nonce, server_ecdh_pub, server_identity_pub} dict to send
+        as attest_challenge.
+
+        server_identity_pub is sent early (like a TLS certificate in
+        ServerHello); proof-of-possession comes later in attest_result's
+        server_sig (like CertificateVerify) - see verify_and_derive."""
         if self._registry.lookup(device_id) is None:
             raise AttestationError(f"device {device_id!r} is not registered")
 
@@ -113,7 +133,11 @@ class AttestationVerifier:
         self._pending[device_id] = PendingChallenge(
             nonce=nonce, server_priv=priv, server_pub=pub, issued_at=time.time()
         )
-        return {"nonce": crypto.b64e(nonce), "server_ecdh_pub": crypto.b64e(pub)}
+        return {
+            "nonce": crypto.b64e(nonce),
+            "server_ecdh_pub": crypto.b64e(pub),
+            "server_identity_pub": crypto.b64e(self._identity_pub_raw),
+        }
 
     # -- step 3/4: attest_response -> attest_result -------------------------
     def verify_and_derive(
@@ -123,9 +147,11 @@ class AttestationVerifier:
         quote_b64: str,
         signature_b64: str,
         pcr_values_text: str,
-    ) -> None:
+    ) -> bytes:
         """Raises AttestationError on any failed check; otherwise stores the
-        derived session key for `device_id` (see `session_key`)."""
+        derived session key for `device_id` (see `session_key`) and returns the
+        raw 64-byte server-identity signature (r||s) to ship in attest_result,
+        which lets the device prove it's talking to the server it pinned."""
         record = self._registry.lookup(device_id)
         if record is None:
             raise AttestationError(f"device {device_id!r} is not registered")
@@ -185,6 +211,16 @@ class AttestationVerifier:
             self._sessions[device_id] = DeviceSession(
                 key=key, expires=time.time() + C.DEVICE_SESSION_TTL_SECONDS
             )
+
+        # Prove server identity: sign this session's transcript with the pinned
+        # identity key. Labelled + distinct from the device's own quote so the
+        # two signatures can't be confused. The device recomputes the identical
+        # pre-image in the TA and verifies against its pinned public key before
+        # trusting the session key.
+        pre_image = (
+            SERVER_IDENTITY_LABEL + pending.nonce + pending.server_pub + device_ecdh_pub
+        )
+        return crypto.sign_server_identity_raw(self._identity_priv, pre_image)
 
     # -- session key lookup (used by attested_network.py to decrypt "data") -
     def session_key(self, device_id: str) -> bytes | None:

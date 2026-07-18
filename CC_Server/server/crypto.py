@@ -21,6 +21,7 @@ import os
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -108,9 +109,65 @@ def aead_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, aad: bytes) -> byt
     return AESGCM(key).decrypt(nonce, ciphertext, aad)
 
 
+# --- Server-identity ECDSA P-256 (device pins this, TOFU) ------------------
+# A dedicated, persisted signing key the server uses to prove its own identity
+# to devices, separate from the ephemeral ECDH keys above and from the RSA TLS
+# cert. The device pins its public key on first use and thereafter demands a
+# fresh signature under it - see docs/HANDOFF_serverAuthentication.md.
+def ensure_server_identity_key(key_path: str) -> ec.EllipticCurvePrivateKey:
+    """Load the persisted server-identity P-256 key, generating it once if it
+    doesn't exist yet.
+
+    NEVER regenerate an existing key - doing so would silently break every
+    device that has already pinned the old public key (they would then reject
+    the server permanently). Mirrors ensure_self_signed_cert()'s generate-if-
+    missing idempotency, but stores a bare EC private key (no X.509 at all -
+    the device pins the raw public point, never a certificate).
+    """
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as f:
+            return serialization.load_pem_private_key(f.read(), password=None)
+
+    os.makedirs(os.path.dirname(key_path), exist_ok=True)
+    key = ec.generate_private_key(ec.SECP256R1())
+    with open(key_path, "wb") as f:
+        f.write(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+    return key
+
+
+def public_point_raw(priv: ec.EllipticCurvePrivateKey) -> bytes:
+    """The 65-byte uncompressed SEC1 point (0x04 || X || Y) for a P-256 key -
+    the exact encoding the device already parses for the ECDH public keys."""
+    return priv.public_key().public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    )
+
+
+def sign_server_identity_raw(priv: ec.EllipticCurvePrivateKey, message: bytes) -> bytes:
+    """ECDSA-P256-SHA256 sign `message`, returning the RAW 64-byte r||s form.
+
+    `cryptography` produces a DER-encoded (r, s); we decode it and left-pad each
+    integer to 32 bytes so the TA can verify with TEE_AsymmetricVerifyDigest
+    without parsing any ASN.1. `message` is the pre-image bytes (the label +
+    transcript inputs) - it is hashed with SHA-256 here, and the TA verifies
+    against SHA-256 of the identical pre-image.
+    """
+    der = priv.sign(message, ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
 __all__ = [
     "b64e", "b64d", "random_bytes",
     "p256_generate", "p256_shared",
     "hkdf", "aead_encrypt", "aead_decrypt",
+    "ensure_server_identity_key", "public_point_raw", "sign_server_identity_raw",
     "InvalidTag",
 ]

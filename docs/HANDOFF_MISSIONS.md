@@ -35,12 +35,22 @@ Read these before touching anything — they explain the *why*, not just the *wh
   runbook, including the multi-device setup.
 - **[`HANDOFF_persistentAK.md`](HANDOFF_persistentAK.md)** — the fully-specced next
   step for mission 2.1.a below.
+- **[`SENSOR_PATH_IMPLEMENTATION.md`](SENSOR_PATH_IMPLEMENTATION.md)** — the sensor
+  path: secure-only UART2, the `sensor_link` PTA, real HMAC-SHA256 sensor
+  authentication, and why the Host CA never sees sensor plaintext.
+- **[`HANDOFF_serverAuthentication.md`](HANDOFF_serverAuthentication.md)** — the
+  fully-specced next step for mission 2.4 below: the device↔server handshake
+  is currently unilateral (device proves itself, server proves nothing), so a
+  compromised Host can redirect attestation to a malicious server and get it
+  to decrypt real sensor data.
 - **[`TERMINOLOGY.md`](TERMINOLOGY.md)** — glossary if any term below is unfamiliar.
 
-**End-to-end flow in one line:** sensor → TA generates the reading and seals it
-with AES-256-GCM (plaintext never leaves secure world) → host push loop sends it
-over the attested session → server verifies the quote, decrypts, and buffers the
-reading → UI "collect" reads the buffer and shows the trust verdict.
+**End-to-end flow in one line:** sensor authenticates to the device (real
+HMAC-SHA256, over a Normal-World-invisible UART) → TA pulls the reading over
+that same UART and seals it with AES-256-GCM (plaintext never leaves secure
+world, never touches the Host) → host push loop sends it over the attested
+session → server verifies the quote, decrypts, and buffers the reading → UI
+"collect" reads the buffer and shows the trust verdict.
 
 ---
 
@@ -175,81 +185,70 @@ reading → UI "collect" reads the buffer and shows the trust verdict.
 
 ---
 
-## Natalie / Emily — the sensor path
+## Natalie / Emily — the sensor path — **RESOLVED**
 
-This is where most of our C code is still **mock/stub**. Two hard requirements
-frame everything below; read them first.
+- **Resolution:** the whole Sensor↔Device half is now real, not mock/stub.
+  `ta_authenticate_sensor` runs a genuine HMAC-SHA256 challenge-response,
+  verified inside the TA via `TEE_MACCompareFinal()` against a pre-shared
+  secret held in TA secure storage (never compiled into source — provisioned
+  by the new `scripts/pair-sensor.sh`). The old `ta_process_sensor_data` +
+  `ta_protect_sensor_data` pair is collapsed into a single
+  `ta_read_and_protect` (command `READ_AND_PROTECT`) with **no plaintext
+  input parameter at all** — both requirements below are now met by
+  construction, not by convention. `edge_get_sensor_data` (the dead stub)
+  and `sensor_module/secure_element.c`/`sensor_module.c` (empty stubs) are
+  deleted; `sensor_module/sensor_daemon.c` is the real Sensor Module
+  companion process. Full design, the QEMU/PTA mechanism that makes
+  Requirement 1 physically true (not just structurally true), and the
+  positive/negative-path verification performed: **`docs/SENSOR_PATH_IMPLEMENTATION.md`.**
+- **Original problem (for context):** this section used to document two
+  hard requirements and hand off the stub code that didn't yet meet them —
+  Requirement 1 (sensor plaintext must stay inside the TA; the Host must
+  never see it) and Requirement 2 (explaining the `g_mock_value` mock
+  counter standing in for a real reading). Both requirements, and the
+  mission's two sub-tasks (2.3.a "replace the sensor mock/stub code," 2.3.b
+  "the Secure-Element emulation itself"), are superseded by the resolution
+  above — see `docs/SENSOR_PATH_IMPLEMENTATION.md` for exactly how each was
+  addressed, including the buffer-size ripple this section warned about
+  (resolved by capping the reading at 256 bytes, which fits every existing
+  downstream buffer unchanged) and the multi-device `TODO` on the old
+  `g_mock_value` counter (moot — that counter no longer exists, readings
+  come from the sensor_link PTA per TA session).
 
-**Requirement 1 — sensor plaintext must stay inside the TA; the Host must never
-see it.** Today `ta_process_sensor_data` builds the reading in secure world and
-`ta_protect_sensor_data` seals it with AES-256-GCM, and `ta_protect_sensor_data`
-**deliberately ignores** the Host-supplied `params[0]` plaintext — the value must
-originate *inside* the TA (`project/optee_examples/confidential_iot/edge_device/ta/trusted_app.c`).
-A real sensor must preserve this: if the sensor hands plaintext to the Host
-first, the property breaks. **Known gap to design around:** sensor plaintext
-currently transits the Host on the way *in*; the real design needs a secure
-peripheral / PTA path so Normal World never sees it (see `ATTESTATION_DESIGN.md`
-§2.6, the relay model).
+---
 
-**Requirement 2 — the mock counter, explained.** `g_mock_value` in
-`.../ta/trusted_app.c` is a file-scope `static uint32_t`, incremented once per
-`PROCESS_SENSOR_DATA` call and formatted as
-`{"samples":[{"value":N,"unit":"count"}]}`. It lives in the TA so the value is
-generated in secure world and only leaves as ciphertext. It is **distinct from
-`send_seq`** (the per-session anti-replay counter) and resets only on TA-instance
-restart (reboot). Note the existing `TODO(multi-device)`: a single static counter
-is fine for one device; several devices need per-session state.
+## Anyone can take this
 
-### 2.3.a — Replace the sensor mock/stub code (and mind the ripples)
+### 2.4 — Device↔server attestation is unilateral: the device never verifies the server's identity
 
-- **Problem:** the whole Sensor↔Device half is stubbed. The stubbed pieces:
-  - `ta_authenticate_sensor` — **stub**, unconditionally sets
-    `sensor_authenticated = true` (`.../ta/trusted_app.c`). The real Secure-Element
-    HMAC-SHA256 challenge-response must verify **inside the TA** and set the flag
-    only on a genuine match — never trust a Host-supplied "it matched."
-  - `ta_process_sensor_data` — produces the **mock counter**, not a real reading.
-  - `edge_get_sensor_data` — **superseded stub**, returns 0
-    (`.../edge_device/host/edge_device.c`).
-  - `edge_authenticate_sensor` — **stub trigger**, parameterless; carries the note
-    *"REMEMBER TO CHANGE THIS IF YOU ADD PARAMETERS (EMILY)"* (`.../host/edge_device.c`).
-  - `edge_call_ta` — `TODO`; only `PROTECT_SENSOR_DATA` is wired, AUTHENTICATE /
-    PROCESS are out of scope there (`.../host/edge_device.c`).
-  - The `AUTHENTICATE_SENSOR` command interface is a **placeholder (no params)**
-    (`.../ta/include/confidential_iot_ta.h`). A real challenge-response can't be
-    parameterless — expect real params and **likely a second command** (TA emits a
-    challenge → Host relays it to the Secure Element → response comes back → Host
-    passes it to the TA → TA verifies). See `ATTESTATION_DESIGN.md` §2.6.
-- **Struct change (this ripples!):** the reading buffer is `char mock_reading[64]`
-  + `mock_reading_len` in `struct confidential_iot_session`
-  (`.../ta/trusted_app.h`). Real sensor data — larger, and a different schema —
-  means **changing this struct**, which changes buffer sizes all down the path.
-- **⚠ Non-mock functions that will break with real/larger sensor data** (this is
-  the "look for functions that aren't mock but need to change after your
-  additions" ask — **yes, `ta_protect_sensor_data` is one of them**):
-  - `ta_protect_sensor_data` (`.../ta/trusted_app.c`) — seals exactly
-    `sess->mock_reading` / `mock_reading_len` and checks
-    `params[2].memref.size < mock_reading_len + tag`. Its *shape* stays correct,
-    but every buffer sized for the tiny mock JSON must grow with the struct.
-  - Its caller `ta_protect_and_encode` (`.../host/edge_device.c`) — `uint8_t
-    ciphertext[512]`, the `combined[]` buffer, and the
-    `input_size > sizeof(ciphertext) - 16` guard.
-  - `edge_send_sensor_data_to_server` (`.../host/edge_device.c`) — `uint8_t
-    raw[600]`, `char ct_b64[900]`.
-  - `main.c` (`.../host/main.c`) — `char protected_data[512]`.
-  - The **JSON schema** emitted by `ta_process_sensor_data` must stay in sync with
-    the server's expected sample shape / aggregation
-    (`CC_Server/server/service.py`) — changing the reading changes *both* ends.
-  - All of the above are sized for the mock counter; a real or high-bandwidth
-    payload (e.g. camera frames) overflows them. Revisit them **together** with
-    the struct change.
-
-### 2.3.b — Also on your plate
-
-- The **Secure-Element emulation itself** (`sensor_module/secure_element.c`,
-  `sensor_module.c`) is still a stub and must implement the real HMAC-SHA256
-  challenge-response that `ta_authenticate_sensor` will verify.
-- Confirm the **relay path** keeps plaintext out of Normal World: the Host may
-  relay the challenge/response bytes, but must never learn the sensor plaintext —
-  the verification verdict lives in the TA (see `ATTESTATION_DESIGN.md` §2.6). If
-  a real sensor delivers data through the Host, that's the gap in Requirement 1
-  above and needs a secure-peripheral / PTA design, not just a code swap.
+- **Problem:** the device (Prover) proves itself to the server (Verifier) via
+  a TPM quote, but nothing proves the server's identity to the device. The
+  quote's qualifying data (`SHA256(nonce ‖ server_ecdh_pub ‖ device_ecdh_pub)`)
+  is over public values and doesn't bind to a specific trusted server, and
+  the ECDH session key is derived with *whoever* supplied `server_ecdh_pub` —
+  there's no wrong-party failure mode in ECDH, only a real shared secret with
+  whoever you exchanged keys with. Port 9000/9100 has no TLS/server-cert
+  check by design. **Consequence:** a compromised Host (or anyone who can
+  redirect `SERVER_HOST`/`SERVER_PORT`) can point the device at a server it
+  controls; the fake server needs no cryptography at all — just speak the
+  JSON protocol and always answer `ok: true` — and it will receive genuine,
+  decryptable sensor data. This is independent of and predates the sensor
+  path (`docs/SENSOR_PATH_IMPLEMENTATION.md`).
+- **Solution:** trust-on-first-use — the device pins the server's public key
+  into TA secure storage on the first genuine attestation after deployment,
+  then requires a valid signature against that pinned key on every
+  attestation after, refusing to derive a session key otherwise. The key is a
+  **dedicated ECDSA P-256 identity keypair**, generated once and persisted
+  server-side — deliberately *not* the server's existing RSA-2048 TLS
+  certificate (`transport/tls.py`, which keeps serving TLS on port 8000
+  unchanged), for consistency with every other key in this project and to
+  avoid RSA inside the TEE. Verification must happen **inside the TA**, not
+  the Host CA, for the same reason every other trust gate in this project
+  does (§2.6 of `ATTESTATION_DESIGN.md`). Full spec, including exact protocol
+  message changes and a testing plan: **`docs/HANDOFF_serverAuthentication.md`.**
+- **Where:** `CC_Server/server/crypto.py`/`attestation.py`/
+  `device_link/attested_network.py` (server-side signing + new protocol
+  fields), `edge_device/host/edge_device.c` (thread the new fields through),
+  `edge_device/ta/trusted_app.c`/`.h`, `confidential_iot_ta.h`
+  (`ta_handshake_complete` — pin/compare/verify before session-key
+  derivation).

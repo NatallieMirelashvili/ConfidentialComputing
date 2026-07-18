@@ -40,4 +40,10 @@ rm -rf \
   "$OPTEE_WORKSPACE/out-br/per-package/optee_examples_ext" \
   "$OPTEE_WORKSPACE/out-br/per-package/libcurl"
 
+# sensor_module/sensor_daemon.c models a physically separate Sensor Module
+# board and runs OUTSIDE the QEMU guest, on this same host/container - so it
+# is a plain NATIVE build (see sensor_module/Makefile), entirely independent
+# of the OP-TEE/Buildroot cross-compilation pipeline below.
+make -C "$ROOT_DIR/project/optee_examples/confidential_iot/sensor_module"
+
 exec "$ROOT_DIR/scripts/build.sh"
