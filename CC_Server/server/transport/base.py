@@ -1,8 +1,8 @@
 """UserChannel — the pluggable User<->Server transport-security interface.
 
-Two implementations live beside this file (tls.py, aesgcm.py). The app picks one
-at launch. Keeping them behind one interface means app_server.py's endpoints are
-written once and never mention encryption.
+Implementations live beside this file (currently just tls.py). The app picks
+one at launch. Keeping them behind one interface means app_server.py's
+endpoints are written once and never mention encryption.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from fastapi import FastAPI
 
 
 class UserChannel(ABC):
-    """Interface both transport modes implement.
+    """Interface every transport mode implements.
 
     The three hooks are the entire contract:
       - ssl_context(): transport-layer encryption (TLS) or None (app-layer/none)
@@ -36,9 +36,10 @@ class UserChannel(ABC):
     def install(self, app: FastAPI) -> None:
         """Hook to register any middleware / routes this mode needs.
 
-        TLS mode: nothing (encryption is at the transport layer).
-        AES-GCM mode: the /api/handshake route + the envelope middleware.
-        Default is a no-op so simple modes don't have to override it.
+        TLS mode: nothing (encryption is at the transport layer). A future
+        app-layer mode would register its handshake route + envelope
+        middleware here. Default is a no-op so simple modes don't have to
+        override it.
         """
 
     @abstractmethod

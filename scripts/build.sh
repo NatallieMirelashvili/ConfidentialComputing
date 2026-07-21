@@ -31,3 +31,13 @@ if [[ -f "$OPTEE_WORKSPACE/toolchains/rust/.cargo/env" ]]; then
 fi
 
 make -j"$(nproc)"
+
+# Stamp this build so scripts/run-project.sh can tell a genuine rebuild apart
+# from a plain relaunch/guest-reboot. On the next run, a device whose disk was
+# built against an older stamp is wiped to a fresh device (new AK + fresh
+# server-key TOFU) - the server's identity key may have rotated on rebuild,
+# and a pinned device would otherwise be locked out. See
+# docs/HANDOFF_serverAuthentication.md and docs/ATTESTATION_DESIGN.md. A new,
+# unique value each successful build is all that's needed.
+printf '%s.%s\n' "$(date +%s)" "$RANDOM" > "$ROOT_DIR/.build-stamp"
+echo "build stamp: $(cat "$ROOT_DIR/.build-stamp")"

@@ -2,125 +2,18 @@
 
 // ---------------------------------------------------------------------------
 // Transport-security handling. The server tells us the mode via /api/security.
-//   tls    -> plain fetch over https (TLS 1.3 encrypts the wire)
-//   aesgcm -> ECDH handshake, then every secure call is an {iv, ct} envelope
-// These parameters MUST match server/transport/aesgcm.py + constants.py.
+//   tls -> plain fetch over https (TLS 1.3 encrypts the wire); the only mode
+//          implemented today. A future app-layer mode would add its own
+//          handshake + envelope logic here, gated on `mode`.
 // ---------------------------------------------------------------------------
-const HKDF_INFO = "CC-IOT-1 user-aead";
-
 let mode = "unknown";
-let sessionId = null;
-let aesKey = null; // CryptoKey for aesgcm mode
-
-// --- base64 helpers --------------------------------------------------------
-function b64e(bytes) {
-  let s = "";
-  bytes.forEach((b) => (s += String.fromCharCode(b)));
-  return btoa(s);
-}
-function b64d(str) {
-  return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
-}
-function concat(a, b) {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
-}
-
-// --- AES-GCM mode: ECDH handshake -----------------------------------------
-async function handshake() {
-  const kp = await crypto.subtle.generateKey(
-    { name: "ECDH", namedCurve: "P-256" },
-    false,
-    ["deriveBits", "deriveKey"]
-  );
-  const clientPub = new Uint8Array(
-    await crypto.subtle.exportKey("raw", kp.publicKey)
-  );
-
-  const res = await fetch("/api/handshake", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ client_pub: b64e(clientPub) }),
-  });
-  const j = await res.json();
-  sessionId = j.session_id;
-  const serverPubRaw = b64d(j.server_pub);
-
-  const serverPub = await crypto.subtle.importKey(
-    "raw",
-    serverPubRaw,
-    { name: "ECDH", namedCurve: "P-256" },
-    false,
-    []
-  );
-  const sharedBits = await crypto.subtle.deriveBits(
-    { name: "ECDH", public: serverPub },
-    kp.privateKey,
-    256
-  );
-  const hkdfKey = await crypto.subtle.importKey(
-    "raw",
-    sharedBits,
-    "HKDF",
-    false,
-    ["deriveKey"]
-  );
-  aesKey = await crypto.subtle.deriveKey(
-    {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: concat(clientPub, serverPubRaw), // order: client || server
-      info: new TextEncoder().encode(HKDF_INFO),
-    },
-    hkdfKey,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
-
-async function seal(plaintextStr) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(
-    await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv },
-      aesKey,
-      new TextEncoder().encode(plaintextStr)
-    )
-  );
-  return { iv: b64e(iv), ct: b64e(ct) };
-}
-
-async function open(env) {
-  const pt = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: b64d(env.iv) },
-    aesKey,
-    b64d(env.ct)
-  );
-  return new TextDecoder().decode(pt);
-}
 
 // --- transport-agnostic API calls -----------------------------------------
 async function apiGet(path) {
-  if (mode === "aesgcm") {
-    const res = await fetch(path, { headers: { "X-Session-Id": sessionId } });
-    return JSON.parse(await open(await res.json()));
-  }
   return (await fetch(path)).json();
 }
 
 async function apiPost(path, obj) {
-  if (mode === "aesgcm") {
-    const env = await seal(JSON.stringify(obj));
-    const res = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Session-Id": sessionId },
-      body: JSON.stringify(env),
-    });
-    return JSON.parse(await open(await res.json()));
-  }
   return (
     await fetch(path, {
       method: "POST",
@@ -136,12 +29,7 @@ const $ = (id) => document.getElementById(id);
 function setSecBadge() {
   const el = $("secbadge");
   el.className = "secbadge " + mode;
-  el.textContent =
-    mode === "tls"
-      ? "channel: TLS 1.3"
-      : mode === "aesgcm"
-      ? "channel: AES-256-GCM (app-layer)"
-      : "channel: unknown";
+  el.textContent = mode === "tls" ? "channel: TLS 1.3" : "channel: unknown";
 }
 
 async function init() {
@@ -149,7 +37,6 @@ async function init() {
   const sec = await (await fetch("/api/security")).json();
   mode = sec.mode;
   setSecBadge();
-  if (mode === "aesgcm") await handshake();
 
   const devs = await apiGet("/api/devices");
   const sel = $("device");

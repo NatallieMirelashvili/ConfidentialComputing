@@ -8,12 +8,19 @@ Wire protocol (newline-delimited JSON, one persistent TCP connection):
 
     device -> server   {"type": "hello", "device_id": "..."}
     server -> device    {"type": "attest_challenge", "nonce": "<b64>",
-                          "server_ecdh_pub": "<b64>"}
+                          "server_ecdh_pub": "<b64>",
+                          "server_identity_pub": "<b64>"}
     device -> server    {"type": "attest_response", "device_id": "...",
                           "device_ecdh_pub": "<b64>", "quote": "<b64>",
                           "signature": "<b64>", "pcr_values": "<text>"}
     server -> device    {"type": "attest_result", "ok": true|false,
-                          "session_ttl"?: <int>, "error"?: "..."}
+                          "session_ttl"?: <int>, "server_sig"?: "<b64>",
+                          "error"?: "..."}
+
+`server_identity_pub` (65-byte SEC1 point) and `server_sig` (raw 64-byte r||s)
+let the device authenticate the SERVER: it pins server_identity_pub on first
+use and thereafter requires server_sig to verify under the pinned key before
+trusting the session - see docs/HANDOFF_serverAuthentication.md.
     device -> server    {"type": "data", "device_id": "...", "seq": <int>,
                           "nonce": "<b64>", "ciphertext": "<b64>"}
                           (repeatable, AEAD-wrapped JSON {"samples": [...]};
@@ -33,6 +40,7 @@ the device side.
 from __future__ import annotations
 
 import json
+import logging
 import socketserver
 import threading
 import time
@@ -41,10 +49,11 @@ from collections import defaultdict, deque
 from .. import constants as C
 from ..attestation import AttestationError, AttestationVerifier
 from ..config import CONFIG
-from ..crypto import InvalidTag, aead_decrypt, b64d
+from ..crypto import InvalidTag, aead_decrypt, b64d, b64e
 from .base import Batch, DeviceLink, Sample
 
 _MAX_BUFFER = 100_000
+_logger = logging.getLogger(__name__)
 
 
 class AttestedNetworkDeviceLink(DeviceLink):
@@ -86,6 +95,7 @@ class AttestedNetworkDeviceLink(DeviceLink):
                     try:
                         challenge = self._verifier.issue_challenge(device_id)
                     except AttestationError as exc:
+                        _logger.warning("hello rejected for device_id=%r: %s", device_id, exc)
                         writeline({"type": "error", "error": str(exc)})
                         device_id = None
                         continue
@@ -98,7 +108,7 @@ class AttestedNetworkDeviceLink(DeviceLink):
                                    "error": "send hello first"})
                         continue
                     try:
-                        self._verifier.verify_and_derive(
+                        server_sig = self._verifier.verify_and_derive(
                             device_id=device_id,
                             device_ecdh_pub_b64=msg["device_ecdh_pub"],
                             quote_b64=msg["quote"],
@@ -106,11 +116,15 @@ class AttestedNetworkDeviceLink(DeviceLink):
                             pcr_values_text=msg["pcr_values"],
                         )
                     except (AttestationError, KeyError) as exc:
+                        _logger.warning(
+                            "attest_response rejected for device_id=%r: %s", device_id, exc
+                        )
                         writeline({"type": "attest_result", "ok": False,
                                    "error": str(exc)})
                         continue
                     writeline({"type": "attest_result", "ok": True,
-                               "session_ttl": C.DEVICE_SESSION_TTL_SECONDS})
+                               "session_ttl": C.DEVICE_SESSION_TTL_SECONDS,
+                               "server_sig": b64e(server_sig)})
 
                 elif msg_type == "data":
                     if not device_id:

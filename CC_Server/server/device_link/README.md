@@ -22,8 +22,12 @@ class Batch:
 `measurement_ok`) are what the UI shows as trust chips.
 
 ## Implementation
-- **`stub.py` — `StubDeviceLink`**: synthesises attested sensor data so the
-  User↔Server app runs and demos with no hardware. `get_device_link()` returns it.
+No synthetic fallback — `MS_DEVICE_LINK` must select one of these, or
+`get_device_link()` raises at startup:
 
-The real Server↔Device link (remote attestation, encrypted sensor channel) is a
-separate part of the project and is intentionally **not** in this codebase.
+- **`network.py` — `NetworkDeviceLink`**: a TCP listener fed by a real edge
+  device; plaintext, trusts a self-reported `attested` flag. Lightweight
+  demo/back-compat mode.
+- **`attested_network.py` — `AttestedNetworkDeviceLink`**: a TCP listener fed
+  by a real edge device, gated by remote attestation + key exchange
+  (`../attestation.py`), with sensor data carried as AES-256-GCM envelopes.

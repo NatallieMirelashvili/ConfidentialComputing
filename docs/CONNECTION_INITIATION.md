@@ -51,7 +51,7 @@ the device already opened** — it never opens a new connection back to the
 device:
 
 ```json
-{"type":"attest_challenge","nonce":"<fresh 20-32B>","server_ecdh_pub":"<P-256 point>"}
+{"type":"attest_challenge","nonce":"<fresh 20-32B>","server_ecdh_pub":"<P-256 point>","server_identity_pub":"<P-256 point>"}
 ```
 
 The **nonce originates at the server**. This is the crux: the device cannot
@@ -64,6 +64,23 @@ The device attests (TPM quote over the transcript hash), the session key is
 derived, and from then on data messages are AEAD-encrypted. See
 [`ATTESTATION_DESIGN.md`](ATTESTATION_DESIGN.md) for the full attestation and
 key-exchange detail.
+
+### 2a. The server also proves *its* identity (mutual trust)
+
+Attestation as described so far is **one-directional**: the device proves
+itself to the server. But `hello` proving nothing cuts both ways — on its own
+it also gives the *device* no assurance about *who* it is talking to, so a
+compromised Host that redirected `SERVER_HOST`/`SERVER_PORT` could point the
+device at an impostor. To close that gap, the server now also authenticates
+itself: it advertises a dedicated **server-identity public key**
+(`server_identity_pub`) in `attest_challenge`, and in `attest_result` it
+returns `server_sig` — a fresh ECDSA-P256 signature over *this* session's
+transcript. The device's **TA** pins `server_identity_pub` on the first
+genuine attestation (Trust-On-First-Use) and, on every handshake, refuses to
+derive the session key unless `server_sig` verifies under the pinned key.
+Because that check lives in the TA, a compromised Host cannot skip it. See
+[`ATTESTATION_DESIGN.md`](ATTESTATION_DESIGN.md) §2.10 and
+[`HANDOFF_serverAuthentication.md`](HANDOFF_serverAuthentication.md).
 
 ### 3. The connection stays open and the device pushes on a timer
 
@@ -109,15 +126,17 @@ sequenceDiagram
     D->>S: hello with device_id
 
     Note over S: look up device_id in registry
-    S-->>D: attest_challenge - nonce and server_ecdh_pub
+    S-->>D: attest_challenge - nonce, server_ecdh_pub, server_identity_pub
     Note over S,D: server DRIVES attestation, nonce originates at the server
 
     D->>D: TA makes ephemeral ECDH key, fTPM quotes transcript hash
     D-->>S: attest_response - quote, signature, pcr_values
 
     Note over S: verify signature, PCR digest, freshness, PCR baseline
-    S-->>D: attest_result ok true
-    Note over S,D: session key derived on both sides
+    S->>S: sign transcript with server-identity key
+    S-->>D: attest_result ok true, server_sig
+    Note over D: TA verifies server_sig and PINS server_identity_pub (TOFU),<br/>then derives the session key - mismatch/bad sig = refuse
+    Note over S,D: session key derived on both sides - trust is now MUTUAL
 
     Note over D,S: Connection stays OPEN, device streams on a timer
     loop every CIOT_PUSH_INTERVAL, default 3s

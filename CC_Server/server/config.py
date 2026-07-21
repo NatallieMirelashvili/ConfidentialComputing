@@ -7,9 +7,9 @@ obvious source of truth for anything tunable at launch.
 Environment variables:
     MS_API_HOST        (default 127.0.0.1)   user-facing bind host
     MS_API_PORT        (default 8000)        user-facing bind port
-    MS_USER_SECURITY   (default tls)         "tls" | "aesgcm"
+    MS_USER_SECURITY   (default tls)         "tls" (only mode currently implemented)
     MS_CERTS_DIR       (default server/certs) where the TLS self-signed cert lives
-    MS_DEVICE_LINK     (default stub)        "stub" | "network" (data source)
+    MS_DEVICE_LINK     (required)            "network" | "attested_network" (data source)
     MS_DEVICE_HOST     (default 0.0.0.0)     bind host for the device TCP listener
     MS_DEVICE_PORT     (default 9000)        port the edge device connects to (network link)
     MS_DEVICE_REGISTRY_PATH (default server/device_registry.json) enrolled device identities
@@ -36,12 +36,13 @@ class Config:
 
     api_host: str = "127.0.0.1"                 # interface the HTTP/HTTPS server binds
     api_port: int = 8000                        # port the UI + API listen on
-    user_security: str = C.USER_SECURITY_TLS    # "tls" or "aesgcm" (see transport/)
+    user_security: str = C.USER_SECURITY_TLS    # "tls" — only mode implemented (see transport/)
     # certs_dir uses default_factory because its default is computed (a path),
     # not a constant literal.
     certs_dir: str = field(default_factory=lambda: os.path.join(_PKG_DIR, "certs"))
-    # Device-facing side (only used when device_link == "network").
-    device_link: str = C.DEVICE_LINK_STUB       # data source: "stub" | "network"
+    # Device-facing side. No default: get_device_link() rejects anything that
+    # isn't a real link, so an empty string here means "not configured".
+    device_link: str = ""                       # data source: "network" | "attested_network"
     device_host: str = "0.0.0.0"                # where the device TCP listener binds
     device_port: int = 9000                     # port the edge device connects to
     # device_registry_path uses default_factory for the same reason as certs_dir.
@@ -57,7 +58,7 @@ class Config:
             api_port=int(os.environ.get("MS_API_PORT", "8000")),
             user_security=os.environ.get("MS_USER_SECURITY", C.USER_SECURITY_TLS),
             certs_dir=os.environ.get("MS_CERTS_DIR", os.path.join(_PKG_DIR, "certs")),
-            device_link=os.environ.get("MS_DEVICE_LINK", C.DEVICE_LINK_STUB),
+            device_link=os.environ.get("MS_DEVICE_LINK", ""),
             device_host=os.environ.get("MS_DEVICE_HOST", "0.0.0.0"),
             device_port=int(os.environ.get("MS_DEVICE_PORT", "9000")),
             device_registry_path=os.environ.get(
@@ -74,6 +75,17 @@ class Config:
     def tls_key_path(self) -> str:
         """Full path to the TLS private-key file (used only in TLS mode)."""
         return os.path.join(self.certs_dir, "server_key.pem")
+
+    @property
+    def server_identity_key_path(self) -> str:
+        """Full path to the device-facing server-identity ECDSA P-256 key.
+
+        Distinct from the RSA TLS key above: this one is signed with per
+        session so devices can pin the server's identity (TOFU) - see
+        docs/HANDOFF_serverAuthentication.md. Reuses certs_dir so it persists
+        in the same server-certs volume as the TLS key.
+        """
+        return os.path.join(self.certs_dir, "server_identity_key.pem")
 
 
 #: Process-wide configuration, read once from the environment at import time.

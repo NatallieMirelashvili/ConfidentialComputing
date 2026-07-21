@@ -38,7 +38,7 @@
   th { color:var(--muted); font-weight:600; }
   .chip { padding:3px 9px; border-radius:999px; font-size:.78rem; font-weight:600; border:1px solid var(--border); }
   .chip.ok{color:var(--ok);border-color:rgba(47,191,113,.4);background:rgba(47,191,113,.12);}
-  .chip.tls{color:var(--ok);} .chip.aes{color:var(--accent);}
+  .chip.tls{color:var(--ok);}
   figure { margin:16px 0; }
   figcaption { color:var(--muted); font-size:.85rem; margin-top:6px; text-align:center; }
   svg { max-width:100%; height:auto; display:block; margin:0 auto; }
@@ -59,15 +59,16 @@
   <span class="tag">Confidential Computing · Group 4</span>
   <h1>Management Server — Architecture &amp; Walkthrough</h1>
   <p class="lead">The <strong>User&nbsp;↔&nbsp;Server</strong> half of the system: an HTML UI + REST API
-  with <strong>selectable transport security</strong> (TLS&nbsp;1.3 or application-layer AES-256-GCM).
-  Sensor data enters through a clean <strong>DeviceLink seam</strong> (a synthetic stub here).</p>
+  protected by <strong>TLS&nbsp;1.3</strong> (pluggable transport security — TLS is the only mode
+  implemented today). Sensor data enters through a clean <strong>DeviceLink seam</strong>, backed
+  by a real edge device over TCP — no synthetic fallback.</p>
 
   <div class="card" style="margin-top:18px">
     <strong>On this page</strong>
     <div class="toc" style="margin-top:8px">
       <a href="#overview">1. Overview &amp; scope</a><br/>
       <a href="#arch">2. Architecture</a><br/>
-      <a href="#modes">3. The two transport modes</a><br/>
+      <a href="#modes">3. Transport security</a><br/>
       <a href="#flow">4. Collect data-flow</a><br/>
       <a href="#map">5. Module &amp; class map</a><br/>
       <a href="#code">6. Key code walkthrough</a><br/>
@@ -89,20 +90,21 @@
       <h3>In scope (built here)</h3>
       <ul style="margin:0;padding-left:18px">
         <li>HTML UI + REST API</li>
-        <li>Two swappable <em>User↔Server</em> security modes: <span class="chip tls">TLS 1.3</span> · <span class="chip aes">AES-256-GCM</span></li>
+        <li>A pluggable <em>User↔Server</em> transport-security interface: <span class="chip tls">TLS 1.3</span> (only mode today)</li>
         <li>Collect → store → aggregate (weighted average, mean, …)</li>
-        <li>A stable <code>DeviceLink</code> seam + runnable stub</li>
+        <li>A stable <code>DeviceLink</code> seam, backed by a real edge device</li>
+        <li>Server↔Device remote attestation &amp; encrypted sensor channel (<code>attested_network</code>)</li>
       </ul>
     </div>
     <div class="card">
       <h3>Out of scope</h3>
       <ul style="margin:0;padding-left:18px">
-        <li>Server↔Device remote attestation</li>
-        <li>Device key exchange &amp; encrypted sensor channel</li>
+        <li>The edge device / TA side (OP-TEE, separate part of the project)</li>
       </ul>
       <p class="muted" style="margin:10px 0 0">Sensor data here comes from
-      <code>StubDeviceLink</code> behind the <code>DeviceLink</code> seam; the real device
-      side is a separate part of the project.</p>
+      <code>AttestedNetworkDeviceLink</code> (or the plaintext <code>NetworkDeviceLink</code>)
+      behind the <code>DeviceLink</code> seam — no synthetic fallback; <code>MS_DEVICE_LINK</code>
+      must select a real link or the server refuses to start.</p>
     </div>
   </div>
 
@@ -125,14 +127,14 @@
       <rect x="30" y="80" width="110" height="34" rx="7" fill="#4c8dff33" stroke="#4c8dff"/>
       <text x="85" y="102" text-anchor="middle" fill="#e6ebf5" font-size="13">Browser UI</text>
       <text x="85" y="140" text-anchor="middle" fill="#93a0b8" font-size="11">web/index.html</text>
-      <text x="85" y="156" text-anchor="middle" fill="#93a0b8" font-size="11">app.js (WebCrypto)</text>
+      <text x="85" y="156" text-anchor="middle" fill="#93a0b8" font-size="11">app.js</text>
 
       <!-- channel -->
       <rect x="210" y="70" width="140" height="100" rx="10" fill="#2fbf7122" stroke="#2fbf71" stroke-width="1.5"/>
       <text x="280" y="46" text-anchor="middle" fill="#93a0b8" font-size="13">transport security</text>
       <text x="280" y="108" text-anchor="middle" fill="#e6ebf5" font-size="13">UserChannel</text>
       <text x="280" y="128" text-anchor="middle" fill="#2fbf71" font-size="11">TLS 1.3</text>
-      <text x="280" y="144" text-anchor="middle" fill="#4c8dff" font-size="11">or AES-GCM</text>
+      <text x="280" y="144" text-anchor="middle" fill="#93a0b8" font-size="11">(only mode today)</text>
 
       <!-- app zone -->
       <rect x="400" y="30" width="230" height="240" rx="10" fill="#2fbf7115" stroke="#2fbf71" stroke-width="1.5"/>
@@ -149,10 +151,12 @@
       <text x="515" y="220" text-anchor="middle" fill="#e6ebf5" font-size="13">DeviceLink (seam)</text>
 
       <!-- data source zone -->
-      <rect x="680" y="165" width="200" height="70" rx="10" fill="#e8b13b12" stroke="#e8b13b" stroke-dasharray="5 4"/>
-      <text x="780" y="152" text-anchor="middle" fill="#93a0b8" font-size="13">data source</text>
-      <rect x="700" y="185" width="160" height="34" rx="7" fill="#131a28" stroke="#27324a"/>
-      <text x="780" y="207" text-anchor="middle" fill="#e6ebf5" font-size="12">StubDeviceLink</text>
+      <rect x="680" y="150" width="200" height="85" rx="10" fill="#e8b13b12" stroke="#e8b13b" stroke-dasharray="5 4"/>
+      <text x="780" y="137" text-anchor="middle" fill="#93a0b8" font-size="13">data source (real device, TCP)</text>
+      <rect x="700" y="168" width="160" height="30" rx="7" fill="#131a28" stroke="#27324a"/>
+      <text x="780" y="188" text-anchor="middle" fill="#e6ebf5" font-size="12">AttestedNetworkDeviceLink</text>
+      <rect x="700" y="200" width="160" height="26" rx="7" fill="#131a28" stroke="#27324a" stroke-dasharray="3 3"/>
+      <text x="780" y="217" text-anchor="middle" fill="#93a0b8" font-size="11">or NetworkDeviceLink</text>
 
       <!-- arrows -->
       <line x1="140" y1="97" x2="208" y2="110" stroke="#93a0b8" marker-end="url(#ah)"/>
@@ -168,57 +172,33 @@
   </figure>
 
   <!-- 3 -->
-  <h2 id="modes">3 · The two transport modes</h2>
-  <p>Both satisfy one interface (<code>UserChannel</code>), so the routes are written once. You pick one
-  at launch with <code>--security tls|aesgcm</code>.</p>
-  <div class="grid2">
-    <figure>
-      <div class="diagram">
-      <svg viewBox="0 0 380 300" role="img" aria-label="TLS mode sequence">
-        <text x="80" y="20" text-anchor="middle" fill="#2fbf71" font-size="13" font-weight="700">TLS 1.3</text>
-        <text x="80" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Browser</text>
-        <text x="300" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Server (https)</text>
-        <line x1="80" y1="48" x2="80" y2="280" stroke="#27324a"/>
-        <line x1="300" y1="48" x2="300" y2="280" stroke="#27324a"/>
-        <line x1="80" y1="80" x2="300" y2="80" stroke="#2fbf71" marker-end="url(#ah)"/>
-        <text x="190" y="74" text-anchor="middle" fill="#93a0b8" font-size="11">TLS 1.3 handshake (library)</text>
-        <line x1="300" y1="112" x2="80" y2="112" stroke="#2fbf71" marker-end="url(#ah)"/>
-        <text x="190" y="106" text-anchor="middle" fill="#93a0b8" font-size="11">encrypted tunnel established</text>
-        <line x1="80" y1="160" x2="300" y2="160" stroke="#4c8dff" marker-end="url(#ah)"/>
-        <text x="190" y="154" text-anchor="middle" fill="#93a0b8" font-size="11">POST /api/collect (plain JSON)</text>
-        <line x1="300" y1="200" x2="80" y2="200" stroke="#4c8dff" marker-end="url(#ah)"/>
-        <text x="190" y="194" text-anchor="middle" fill="#93a0b8" font-size="11">result JSON</text>
-        <text x="190" y="245" text-anchor="middle" fill="#93a0b8" font-size="10.5">app sees plain JSON;</text>
-        <text x="190" y="260" text-anchor="middle" fill="#93a0b8" font-size="10.5">TLS encrypts the wire</text>
-      </svg>
-      </div>
-      <figcaption><code>transport/tls.py</code> — self-signed cert, strict TLS-1.3-only context.</figcaption>
-    </figure>
-    <figure>
-      <div class="diagram">
-      <svg viewBox="0 0 380 300" role="img" aria-label="AES-GCM mode sequence">
-        <text x="80" y="20" text-anchor="middle" fill="#4c8dff" font-size="13" font-weight="700">AES-256-GCM</text>
-        <text x="80" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Browser</text>
-        <text x="300" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Server (http)</text>
-        <line x1="80" y1="48" x2="80" y2="285" stroke="#27324a"/>
-        <line x1="300" y1="48" x2="300" y2="285" stroke="#27324a"/>
-        <line x1="80" y1="76" x2="300" y2="76" stroke="#4c8dff" marker-end="url(#ah)"/>
-        <text x="190" y="70" text-anchor="middle" fill="#93a0b8" font-size="11">/handshake: client P-256 pub</text>
-        <line x1="300" y1="104" x2="80" y2="104" stroke="#4c8dff" marker-end="url(#ah)"/>
-        <text x="190" y="98" text-anchor="middle" fill="#93a0b8" font-size="11">server pub + session_id</text>
-        <text x="190" y="128" text-anchor="middle" fill="#2fbf71" font-size="10.5">both: ECDH → HKDF → AES key</text>
-        <line x1="80" y1="158" x2="300" y2="158" stroke="#e8b13b" marker-end="url(#ah)"/>
-        <text x="190" y="152" text-anchor="middle" fill="#93a0b8" font-size="11">/collect  {iv, ct}  + X-Session-Id</text>
-        <line x1="300" y1="192" x2="80" y2="192" stroke="#e8b13b" marker-end="url(#ah)"/>
-        <text x="190" y="186" text-anchor="middle" fill="#93a0b8" font-size="11">{iv, ct}  (response)</text>
-        <text x="190" y="235" text-anchor="middle" fill="#93a0b8" font-size="10.5">middleware decrypts in /</text>
-        <text x="190" y="250" text-anchor="middle" fill="#93a0b8" font-size="10.5">encrypts out — routes unchanged</text>
-        <text x="190" y="270" text-anchor="middle" fill="#e8b13b" font-size="10.5">on the wire: ciphertext only</text>
-      </svg>
-      </div>
-      <figcaption><code>transport/aesgcm.py</code> — ECDH handshake + ASGI envelope middleware.</figcaption>
-    </figure>
-  </div>
+  <h2 id="modes">3 · Transport security</h2>
+  <p>The route handlers only touch one interface (<code>UserChannel</code>), never the crypto
+  itself. TLS 1.3 is the only mode implemented today; adding another (e.g. mutual-TLS, or an
+  app-layer AEAD mode) is a new file under <code>transport/</code> + one branch in
+  <code>transport/__init__.py</code> — the routes wouldn't change.</p>
+  <figure>
+    <div class="diagram">
+    <svg viewBox="0 0 380 300" role="img" aria-label="TLS mode sequence">
+      <text x="80" y="20" text-anchor="middle" fill="#2fbf71" font-size="13" font-weight="700">TLS 1.3</text>
+      <text x="80" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Browser</text>
+      <text x="300" y="40" text-anchor="middle" fill="#93a0b8" font-size="12">Server (https)</text>
+      <line x1="80" y1="48" x2="80" y2="280" stroke="#27324a"/>
+      <line x1="300" y1="48" x2="300" y2="280" stroke="#27324a"/>
+      <line x1="80" y1="80" x2="300" y2="80" stroke="#2fbf71" marker-end="url(#ah)"/>
+      <text x="190" y="74" text-anchor="middle" fill="#93a0b8" font-size="11">TLS 1.3 handshake (library)</text>
+      <line x1="300" y1="112" x2="80" y2="112" stroke="#2fbf71" marker-end="url(#ah)"/>
+      <text x="190" y="106" text-anchor="middle" fill="#93a0b8" font-size="11">encrypted tunnel established</text>
+      <line x1="80" y1="160" x2="300" y2="160" stroke="#4c8dff" marker-end="url(#ah)"/>
+      <text x="190" y="154" text-anchor="middle" fill="#93a0b8" font-size="11">POST /api/collect (plain JSON)</text>
+      <line x1="300" y1="200" x2="80" y2="200" stroke="#4c8dff" marker-end="url(#ah)"/>
+      <text x="190" y="194" text-anchor="middle" fill="#93a0b8" font-size="11">result JSON</text>
+      <text x="190" y="245" text-anchor="middle" fill="#93a0b8" font-size="10.5">app sees plain JSON;</text>
+      <text x="190" y="260" text-anchor="middle" fill="#93a0b8" font-size="10.5">TLS encrypts the wire</text>
+    </svg>
+    </div>
+    <figcaption><code>transport/tls.py</code> — self-signed cert, strict TLS-1.3-only context.</figcaption>
+  </figure>
 
   <!-- 4 -->
   <h2 id="flow">4 · Collect data-flow</h2>
@@ -260,29 +240,24 @@
     <tr><td><code>store.py</code></td><td>class <code>DataStore</code></td><td>In-memory samples + time-window filter.</td></tr>
     <tr><td><code>processing.py</code></td><td>functions</td><td>Aggregations: raw / mean / min / max / weighted_avg.</td></tr>
     <tr><td><code>transport/base.py</code></td><td>class <code>UserChannel</code></td><td>The security interface (ssl_context / install / describe).</td></tr>
-    <tr><td><code>transport/tls.py</code></td><td>class <code>TlsUserChannel</code></td><td>TLS 1.3: self-signed cert + strict SSLContext.</td></tr>
-    <tr><td><code>transport/aesgcm.py</code></td><td>classes</td><td>ECDH handshake + <code>_AeadASGIMiddleware</code> envelope crypto.</td></tr>
-    <tr><td><code>crypto.py</code></td><td>functions</td><td>P-256 ECDH, HKDF, AES-GCM (used by aesgcm mode).</td></tr>
+    <tr><td><code>transport/tls.py</code></td><td>class <code>TlsUserChannel</code></td><td>TLS 1.3: self-signed cert + strict SSLContext. Only <code>UserChannel</code> implementation today.</td></tr>
+    <tr><td><code>crypto.py</code></td><td>functions</td><td>P-256 ECDH, HKDF, AES-GCM — used by the Device&lt;-&gt;Server attested channel.</td></tr>
     <tr><td><code>device_link/base.py</code></td><td>class <code>DeviceLink</code></td><td>The seam + <code>Sample</code>/<code>Batch</code> types.</td></tr>
-    <tr><td><code>device_link/stub.py</code></td><td>class <code>StubDeviceLink</code></td><td>Synthetic attested data — the data source.</td></tr>
-    <tr><td><code>web/</code></td><td>UI</td><td>index.html + app.js (WebCrypto for aesgcm) + styles.css.</td></tr>
+    <tr><td><code>device_link/network.py</code></td><td>class <code>NetworkDeviceLink</code></td><td>TCP listener; trusts a self-reported <code>attested</code> flag.</td></tr>
+    <tr><td><code>device_link/attested_network.py</code></td><td>class <code>AttestedNetworkDeviceLink</code></td><td>TCP listener gated by remote attestation; AES-256-GCM sensor channel.</td></tr>
+    <tr><td><code>attestation.py</code></td><td>class <code>AttestationVerifier</code></td><td>Verifies the device's quote/signature, derives the session key.</td></tr>
+    <tr><td><code>device_registry.py</code></td><td>functions</td><td>Enrolled device identities (self-registration + reject-mismatch).</td></tr>
+    <tr><td><code>web/</code></td><td>UI</td><td>index.html + app.js + styles.css.</td></tr>
   </table>
 
   <!-- 6 -->
   <h2 id="code">6 · Key code walkthrough</h2>
 
-  <h3>One interface, two security modes</h3>
+  <h3>One interface, pluggable security modes</h3>
   <pre><code><span class="k">class</span> <span class="fn">UserChannel</span>(ABC):        <span class="c"># transport/base.py</span>
-    <span class="k">def</span> <span class="fn">ssl_context</span>(self) -> ssl.SSLContext | None: ...  <span class="c"># TLS returns ctx; AES-GCM None</span>
-    <span class="k">def</span> <span class="fn">install</span>(self, app): ...   <span class="c"># AES-GCM adds /handshake + middleware</span>
+    <span class="k">def</span> <span class="fn">ssl_context</span>(self) -> ssl.SSLContext | None: ...  <span class="c"># TLS returns ctx; app-layer modes None</span>
+    <span class="k">def</span> <span class="fn">install</span>(self, app): ...   <span class="c"># TLS: no-op; a future mode adds routes/middleware here</span>
     <span class="k">def</span> <span class="fn">describe</span>(self) -> dict: ...  <span class="c"># tells the browser which mode is active</span></code></pre>
-
-  <h3>AES-GCM envelope middleware (pure ASGI)</h3>
-  <pre><code><span class="c"># transport/aesgcm.py — decrypt the request in, encrypt the response out,</span>
-<span class="c"># so the routes never change between modes.</span>
-plaintext = crypto.<span class="fn">aead_decrypt</span>(key, iv, ct, b<span class="s">""</span>)   <span class="c"># request body {iv,ct} -> JSON</span>
-...
-ct = crypto.<span class="fn">aead_encrypt</span>(key, new_iv, response_body, b<span class="s">""</span>)  <span class="c"># -> {iv,ct} on the wire</span></code></pre>
 
   <h3>The seam — the only way sensor data enters</h3>
   <pre><code><span class="k">class</span> <span class="fn">DeviceLink</span>(ABC):          <span class="c"># device_link/base.py</span>
@@ -338,17 +313,12 @@ ct = crypto.<span class="fn">aead_encrypt</span>(key, new_iv, response_body, b<s
 .venv\Scripts\Activate.ps1
 pip install -r server/requirements.txt
 
-<span class="c"># TLS 1.3 (default)</span>
+<span class="c"># TLS 1.3 (default, only mode today)</span>
 python -m server.main --security tls       <span class="c"># https://localhost:8000</span>
 
-<span class="c"># application-layer AES-256-GCM</span>
-python -m server.main --security aesgcm     <span class="c"># http://localhost:8000</span>
-
-python -m pytest server/tests -q             <span class="c"># unit + E2E, both modes</span></code></pre>
+python -m pytest server/tests -q             <span class="c"># unit + E2E</span></code></pre>
   <p class="muted"><strong>Security notes.</strong> The TLS cert is self-signed → a one-time local browser
-  warning; the context is TLS-1.3-only. In AES-GCM mode the browser uses WebCrypto (allowed on
-  <code>http://localhost</code>); request/response bodies are <code>{iv, ct}</code> — open devtools →
-  Network to see only ciphertext. All configuration comes from <code>config.Config</code>
+  warning; the context is TLS-1.3-only. All configuration comes from <code>config.Config</code>
   (<code>MS_*</code> env vars).</p>
 
   <footer>

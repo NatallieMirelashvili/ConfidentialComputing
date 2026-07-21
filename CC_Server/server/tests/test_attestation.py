@@ -20,13 +20,18 @@ import struct
 import threading
 
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.asymmetric.utils import (
+    decode_dss_signature,
+    encode_dss_signature,
+)
 
 from server import constants as C
 from server import crypto
 from server.attestation import (
+    SERVER_IDENTITY_LABEL,
     TPM_ALG_ECDSA,
     TPM_ALG_SHA256,
     TPM_GENERATED_VALUE,
@@ -37,6 +42,22 @@ from server.attestation import (
     recompute_pcr_digest,
 )
 from server.device_registry import DeviceRegistry
+
+
+def _assert_server_sig_ok(identity_pub_raw, server_sig_raw, nonce,
+                          server_ecdh_pub, device_ecdh_pub):
+    """Verify a raw 64-byte r||s server-identity signature exactly as the TA
+    will: reconstruct the pre-image, DER-wrap (r, s), and verify against the
+    advertised identity public point. Also asserts the raw form is a clean
+    32+32 split (what TEE_AsymmetricVerifyDigest consumes)."""
+    assert len(server_sig_raw) == 64
+    pub = ec.EllipticCurvePublicKey.from_encoded_point(
+        ec.SECP256R1(), identity_pub_raw
+    )
+    pre_image = SERVER_IDENTITY_LABEL + nonce + server_ecdh_pub + device_ecdh_pub
+    r = int.from_bytes(server_sig_raw[:32], "big")
+    s = int.from_bytes(server_sig_raw[32:], "big")
+    pub.verify(encode_dss_signature(r, s), pre_image, ec.ECDSA(hashes.SHA256()))
 
 
 def _tpm2b(data: bytes) -> bytes:
@@ -198,6 +219,41 @@ def test_attestation_rejects_pcr_mismatch(tmp_path):
     assert fx.verifier.session_key(fx.device_id) is None
 
 
+def test_server_identity_signature_verifies_and_is_raw_64(tmp_path):
+    """verify_and_derive returns a raw 64-byte r||s server-identity signature
+    that (a) verifies against the challenge's server_identity_pub over the
+    labelled transcript, and (b) does NOT verify over a different transcript
+    (a tampered device pubkey) - the exact TOFU check the TA performs."""
+    fx = _Fixture(tmp_path)
+    challenge = fx.verifier.issue_challenge(fx.device_id)
+    identity_pub_raw = crypto.b64d(challenge["server_identity_pub"])
+    nonce = crypto.b64d(challenge["nonce"])
+    server_pub = crypto.b64d(challenge["server_ecdh_pub"])
+
+    device_priv, device_pub, quote, sig = fx.build_response(nonce, server_pub)
+    server_sig = fx.verifier.verify_and_derive(
+        device_id=fx.device_id,
+        device_ecdh_pub_b64=crypto.b64e(device_pub),
+        quote_b64=crypto.b64e(quote),
+        signature_b64=crypto.b64e(sig),
+        pcr_values_text=fx.pcr_text,
+    )
+
+    # (a) valid over the real transcript.
+    _assert_server_sig_ok(identity_pub_raw, server_sig, nonce, server_pub, device_pub)
+
+    # (b) a fake server (different identity key) can't produce a sig that
+    #     verifies against the pinned key - this is the vuln's regression check.
+    _, other_pub_raw = crypto.p256_generate()
+    with pytest.raises(InvalidSignature):
+        _assert_server_sig_ok(other_pub_raw, server_sig, nonce, server_pub, device_pub)
+
+    # (c) tampered transcript (wrong device pubkey) must fail too.
+    _, wrong_device_pub = crypto.p256_generate()
+    with pytest.raises(InvalidSignature):
+        _assert_server_sig_ok(identity_pub_raw, server_sig, nonce, server_pub, wrong_device_pub)
+
+
 def test_attested_network_link_full_protocol(tmp_path):
     """Drives AttestedNetworkDeviceLink's per-connection state machine
     directly (hello -> attest_challenge -> attest_response -> attest_result
@@ -234,6 +290,9 @@ def test_attested_network_link_full_protocol(tmp_path):
                 crypto.p256_shared(device_priv, server_pub),
                 salt=nonce, info=C.INFO_DEVICE_AEAD,
             )
+            session_key["nonce"] = nonce
+            session_key["server_pub"] = server_pub
+            session_key["device_pub"] = device_pub
             return json.dumps({
                 "type": "attest_response",
                 "device_id": fx.device_id,
@@ -270,10 +329,20 @@ def test_attested_network_link_full_protocol(tmp_path):
     link._handle_connection(readline, writeline)
 
     assert outgoing[0]["type"] == "attest_challenge"
-    assert outgoing[1] == {
-        "type": "attest_result", "ok": True,
-        "session_ttl": C.DEVICE_SESSION_TTL_SECONDS,
-    }
+    # The challenge advertises the server's identity public key (65-byte point).
+    assert len(crypto.b64d(outgoing[0]["server_identity_pub"])) == 65
+    # attest_result carries a server_sig that proves possession of that key over
+    # this session's transcript - the device pins + verifies it (TOFU).
+    assert outgoing[1]["type"] == "attest_result"
+    assert outgoing[1]["ok"] is True
+    assert outgoing[1]["session_ttl"] == C.DEVICE_SESSION_TTL_SECONDS
+    _assert_server_sig_ok(
+        identity_pub_raw=crypto.b64d(outgoing[0]["server_identity_pub"]),
+        server_sig_raw=crypto.b64d(outgoing[1]["server_sig"]),
+        nonce=session_key["nonce"],
+        server_ecdh_pub=session_key["server_pub"],
+        device_ecdh_pub=session_key["device_pub"],
+    )
     assert outgoing[2] == {"ok": True}
 
     # Once the connection has ended, the cached verdict must reflect that -
