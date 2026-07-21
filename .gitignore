@@ -66,3 +66,4 @@ compile_commands.json
 # project/optee_examples/confidential_iot/sensor_module/Makefile)
 project/optee_examples/confidential_iot/sensor_module/sensor_daemon
 
+CC_Server/server/device_registry.json

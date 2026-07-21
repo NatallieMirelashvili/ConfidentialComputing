@@ -1,0 +1,163 @@
+diff --git a/plat/qemu/common/qemu_private.h b/plat/qemu/common/qemu_private.h
+index 046cb78..9dd379b 100644
+--- a/plat/qemu/common/qemu_private.h
++++ b/plat/qemu/common/qemu_private.h
+@@ -24,8 +24,7 @@ void plat_qemu_gic_init(void);
+ void qemu_pwr_gic_on_finish(void);
+ void qemu_pwr_gic_off(void);
+ 
+-int qemu_set_tos_fw_info(uintptr_t config_base, uintptr_t log_addr,
+-			size_t log_size);
++int qemu_set_tos_fw_info(uintptr_t log_addr, size_t log_size);
+ 
+ int qemu_set_nt_fw_info(
+ /*
+diff --git a/plat/qemu/qemu/qemu_helpers.c b/plat/qemu/qemu/qemu_helpers.c
+index 1b31ab5..c5b0bf3 100644
+--- a/plat/qemu/qemu/qemu_helpers.c
++++ b/plat/qemu/qemu/qemu_helpers.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <assert.h>
++#include <string.h>
+ 
+ #include <common/bl_common.h>
+ #if MEASURED_BOOT
+@@ -15,13 +16,13 @@
+ 
+ #include <libfdt.h>
+ 
+-#ifdef SPD_opteed
+ /*
+- * Currently OP-TEE does not support reading DTBs from Secure memory
+- * and this property should be removed when this feature is supported.
++ * OP-TEE reads the secure Event Log address from this property (see OP-TEE
++ * core/kernel/tpm.c, which selects it when CFG_MAP_EXT_DT_SECURE is not set).
++ * Used by both the SPD_opteed NT_FW_CONFIG path (qemu_set_tee_fw_info) and the
++ * SPD_spmd TOS_FW_CONFIG path (qemu_set_tos_fw_info).
+  */
+ #define DTB_PROP_HW_SM_LOG_ADDR	"tpm_event_log_sm_addr"
+-#endif
+ 
+ #define DTB_PROP_HW_LOG_ADDR	"tpm_event_log_addr"
+ #define DTB_PROP_HW_LOG_SIZE    "tpm_event_log_size"
+@@ -161,20 +162,73 @@ static int qemu_set_event_log_info(uintptr_t config_base,
+  *	0 = success
+  *    < 0 = error
+  */
+-int qemu_set_tos_fw_info(uintptr_t config_base, uintptr_t log_addr,
+-			size_t log_size)
++int qemu_set_tos_fw_info(uintptr_t log_addr, size_t log_size)
+ {
+-	int err = 0;
++	void *dtb = (void *)(uintptr_t)TOS_FW_CONFIG_BASE;
++	const char *compatible = "arm,tpm_event_log";
++	uint64_t sec_base = cpu_to_fdt64(log_addr);
++	uint32_t sz = cpu_to_fdt32(log_size);
++	int offs, err;
+ 
+-	assert(config_base != 0UL);
+ 	assert(log_addr != 0UL);
+ 
+ 	/*
+-	 * FIXME - add code to add/update Log address and it's
+-	 * size in TOS FW CONFIG.
+-	 * For now we don't have support for TOS FW config in OP-TEE.
+-	 * So leave this function blank
++	 * When OP-TEE runs as the S-EL1 SPMC (SPD=spmd), it reads the TCG Event
++	 * Log from the TOS_FW_CONFIG manifest DT via get_manifest_dt() (see
++	 * OP-TEE core/arch/arm/kernel/boot.c and core/kernel/tpm.c). Publish the
++	 * log location there as an "arm,tpm_event_log" node so the fTPM can
++	 * replay the boot-image measurements into the PCRs. Upstream left this
++	 * function a stub, so without it PCR0 stays all-zero even under FF-A.
++	 *
++	 * TOS_FW_CONFIG is only one page (TOS_FW_CONFIG_LIMIT - _BASE), so open
++	 * the FDT up to that page only - never PLAT_QEMU_DT_MAX_SIZE (used for
++	 * the much larger non-secure DT), which would overrun into adjacent
++	 * secure SRAM.
+ 	 */
++	err = fdt_open_into(dtb, dtb, TOS_FW_CONFIG_LIMIT - TOS_FW_CONFIG_BASE);
++	if (err < 0) {
++		ERROR("Invalid TOS_FW_CONFIG DTB at %p: error %d\n", dtb, err);
++		return err;
++	}
++
++	err = fdt_check_header(dtb);
++	if (err < 0) {
++		WARN("Invalid TOS_FW_CONFIG DTB passed\n");
++		return err;
++	}
++
++	offs = fdtw_find_or_add_subnode(dtb, 0, "tpm-event-log");
++	if (offs < 0) {
++		ERROR("Failed to add node tpm-event-log %d\n", offs);
++		return offs;
++	}
++
++	if (fdt_appendprop(dtb, offs, "compatible", compatible,
++			   strlen(compatible) + 1) < 0) {
++		return -1;
++	}
++
++	err = fdt_setprop(dtb, offs, DTB_PROP_HW_SM_LOG_ADDR, &sec_base, 8);
++	if (err < 0) {
++		ERROR("Failed to add log addr err %d\n", err);
++		return err;
++	}
++
++	err = fdt_setprop(dtb, offs, DTB_PROP_HW_LOG_SIZE, &sz, 4);
++	if (err < 0) {
++		ERROR("Failed to add log size err %d\n", err);
++		return err;
++	}
++
++	err = fdt_pack(dtb);
++	if (err < 0) {
++		ERROR("Failed to pack TOS_FW_CONFIG DTB at %p: err %d\n", dtb,
++		      err);
++		return err;
++	}
++
++	/* Ensure the info written to the DTB is visible to OP-TEE. */
++	flush_dcache_range((uintptr_t)TOS_FW_CONFIG_BASE, fdt_totalsize(dtb));
+ 
+ 	return err;
+ }
+diff --git a/plat/qemu/qemu/qemu_measured_boot.c b/plat/qemu/qemu/qemu_measured_boot.c
+index eae0e8e..a9d183a 100644
+--- a/plat/qemu/qemu/qemu_measured_boot.c
++++ b/plat/qemu/qemu/qemu_measured_boot.c
+@@ -112,15 +112,24 @@ void bl2_plat_mboot_finish(void)
+ 		 * secure Event Log buffer address.
+ 		 */
+ 		WARN("Ignoring TPM errors, continuing without\n");
+-		return;
+-	}
+-
+-	/* Copy Event Log to Non-secure memory */
+-	(void)memcpy((void *)ns_log_addr, (const void *)event_log_base,
+-		     event_log_cur_size);
++		/*
++		 * Do NOT return here. On this fTPM-only QEMU setup the
++		 * non-secure DTB has no `tcg,tpm-tis-mmio` node, so
++		 * qemu_set_nt_fw_info() always fails - but under SPD=spmd the
++		 * secure world (OP-TEE as the S-EL1 SPMC) reads the Event Log
++		 * from TOS_FW_CONFIG below, not from nt_fw_config. Falling
++		 * through lets qemu_set_tos_fw_info() run so the fTPM actually
++		 * receives the log and extends the PCRs. Skip only the
++		 * non-secure copy, whose ns_log_addr is invalid on failure.
++		 */
++	} else {
++		/* Copy Event Log to Non-secure memory */
++		(void)memcpy((void *)ns_log_addr, (const void *)event_log_base,
++			     event_log_cur_size);
+ 
+-	/* Ensure that the Event Log is visible in Non-secure memory */
+-	flush_dcache_range(ns_log_addr, event_log_cur_size);
++		/* Ensure that the Event Log is visible in Non-secure memory */
++		flush_dcache_range(ns_log_addr, event_log_cur_size);
++	}
+ 
+ #if defined(SPD_tspd) || defined(SPD_spmd)
+ 	/* Set Event Log data in TOS_FW_CONFIG */

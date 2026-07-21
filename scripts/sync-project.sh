@@ -67,6 +67,21 @@ if [[ -f "$QEMU_V8_MK" ]] && ! grep -q 'CFG_CORE_TPM_EVENT_LOG=y' "$QEMU_V8_MK";
   sed -i '/^OPTEE_OS_COMMON_FLAGS += DEBUG=\$(DEBUG) CFG_ARM_GICV3=\$(GICV3)/a OPTEE_OS_COMMON_FLAGS += CFG_DT=y CFG_CORE_TPM_EVENT_LOG=y' "$QEMU_V8_MK"
 fi
 
+# Measured boot, topology switch (FF-A / S-EL1 SPMC). The default opteed
+# topology cannot deliver TF-A's TCG event log to the fTPM on this QEMU setup
+# (OP-TEE core logs "TPM: Fail to find TPM node" and PCR sha256:0 stays all-zero
+# - see docs/DESIGN.md). Under SPMC_AT_EL=1, OP-TEE runs as the S-EL1 SPMC and
+# reads the log from the TOS_FW_CONFIG manifest DT via get_manifest_dt(); TF-A
+# hands the log off there via the tfa-tos-fw-config-eventlog.patch applied
+# below. Flipping the qemu_v8.mk default (a single source of truth read by both
+# scripts/build.sh and the run scripts' `make run-only`) keeps the built FIP and
+# the launch topology in lockstep - a mismatch would fail to boot. Do NOT use
+# SEL0_SPS=y for this (it also drags in Trusted-Services test SPs). Generated
+# build repo file, so re-apply on every sync, idempotently.
+if [[ -f "$QEMU_V8_MK" ]] && ! grep -q '^SPMC_AT_EL ?= 1' "$QEMU_V8_MK"; then
+  sed -i 's/^SPMC_AT_EL ?= n$/SPMC_AT_EL ?= 1/' "$QEMU_V8_MK"
+fi
+
 # 3rd QEMU serial backend for the confidential_iot sensor_link PTA's secure
 # UART2 (see project/patches/virt-uart2.patch): serial_hd(0)/(1) already map
 # to NW/SW consoles positionally, so a 3rd `-serial` arg becomes serial_hd(2)
@@ -89,6 +104,23 @@ UART2_PATCH="$ROOT_DIR/project/patches/virt-uart2.patch"
 if [[ -d "$QEMU_SRC" && -f "$UART2_PATCH" ]]; then
   if ! git -C "$QEMU_SRC" apply --reverse --check "$UART2_PATCH" 2>/dev/null; then
     git -C "$QEMU_SRC" apply "$UART2_PATCH"
+  fi
+fi
+
+# Measured boot, TF-A TOS_FW_CONFIG event-log handoff for the S-EL1 SPMC
+# topology (see the SPMC_AT_EL=1 flip above). Upstream TF-A leaves
+# qemu_set_tos_fw_info() an empty FIXME stub for SPD=spmd, so the fTPM never
+# receives the event log and PCR sha256:0 stays all-zero even under FF-A. This
+# patch implements it: it writes the arm,tpm_event_log node (compatible +
+# tpm_event_log_sm_addr + tpm_event_log_size) into the TOS_FW_CONFIG manifest
+# DTB that OP-TEE core reads. trusted-firmware-a is a real git repo under the
+# git-ignored workspace, so git apply with a --reverse --check idempotency
+# guard, exactly like the UART2 patch above.
+TF_A_SRC="$OPTEE_WORKSPACE/trusted-firmware-a"
+TFA_MBOOT_PATCH="$ROOT_DIR/project/patches/tfa-tos-fw-config-eventlog.patch"
+if [[ -d "$TF_A_SRC" && -f "$TFA_MBOOT_PATCH" ]]; then
+  if ! git -C "$TF_A_SRC" apply --reverse --check "$TFA_MBOOT_PATCH" 2>/dev/null; then
+    git -C "$TF_A_SRC" apply "$TFA_MBOOT_PATCH"
   fi
 fi
 

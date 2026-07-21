@@ -1,16 +1,16 @@
 {
   "iot-edge-01": {
     "device_id": "iot-edge-01",
-    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAESMUsdUDHL/RpPtHLM/JU417LtfYR\noM++M7FPOPG+VRfkpQWNJK/eqsXj611rPjiDSDa0HwZ9AyL3hsDgUFfZcw==\n-----END PUBLIC KEY-----\n",
-    "expected_pcr": "  sha256:\n    0 : 0x4FBE3B9C1CC142D4E15FC3C04511B33D84DD9A770C5C678525EA6DFF6F224145\n",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfHfIfUfABv9V/r5cEzEXgo76OV2C\n7GIo6sQhZaRz0oapi3hTFB3BA+o+seTIakLRYTRviY97XYtAYTetU6haaw==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0xBC7DA8B625E806FFEAE21C12A4B7BE9088DF23526D677C68CE79DDE2EAFD9650\n",
     "pcr_bank": "sha256:0",
-    "created_at": 1784396889.4475245
+    "created_at": 1784413638.4268894
   },
   "iot-edge-02": {
     "device_id": "iot-edge-02",
-    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEE4HNbj1F51c7Cp+ekDdriDWI6o+0\nB7JkDdDzAErnMCssHEqniEqStuv2a/XunGUXdPSxO/HRTWnDlDQa21UDNA==\n-----END PUBLIC KEY-----\n",
-    "expected_pcr": "  sha256:\n    0 : 0x4FBE3B9C1CC142D4E15FC3C04511B33D84DD9A770C5C678525EA6DFF6F224145\n",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMPMdDjIR3rla5pIO/dmswgGWLjCM\nxvDkAEnMzR0ziOn1s9Yge6/RRPoHleU/oy0R30g4CTq3Egz8eRVyDD0aAQ==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0xBC7DA8B625E806FFEAE21C12A4B7BE9088DF23526D677C68CE79DDE2EAFD9650\n",
     "pcr_bank": "sha256:0",
-    "created_at": 1784396892.3976421
+    "created_at": 1784413663.713974
   }
 }

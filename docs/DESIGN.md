@@ -310,33 +310,33 @@ Two design notes worth highlighting:
 
 The protocol quotes exactly **`sha256:0`** — PCR index 0, SHA-256 bank. PCRs reset to all-zero on every power-on and can only be *extended*.
 
-### The real (target) measured-boot chain — three links
+### The measured-boot chain (real, firmware-rooted)
+
+Measured boot is **active and rooted in the boot firmware** — as hardware-rooted as an emulated boot chain can be. The device runs the **FF-A / S-EL1 SPMC** topology (`SPMC_AT_EL=1`): OP-TEE runs as the Secure-EL1 SPMC, which is what lets TF-A hand it the TCG event log through the `TOS_FW_CONFIG` manifest.
 
 ```mermaid
 flowchart LR
-    TFA["TF-A (BL1/BL2)<br/>MEASURED_BOOT=1<br/>EVENT_LOG_LEVEL=20<br/>TPM_HASH_ALG=sha256"] -->|"TCG event log"| CORE
-    CORE["OP-TEE core<br/>CFG_DT=y<br/>CFG_CORE_TPM_EVENT_LOG=y"] -->|"forwards log"| FT
+    TFA["TF-A (BL1/BL2)<br/>MEASURED_BOOT=1<br/>measures BL31/BL32/BL33"] -->|"writes arm,tpm_event_log<br/>into TOS_FW_CONFIG"| CORE
+    CORE["OP-TEE core (S-EL1 SPMC)<br/>CFG_CORE_FFA=y<br/>CFG_CORE_TPM_EVENT_LOG=y"] -->|"reads manifest DT,<br/>forwards log"| FT
     FT["fTPM TA<br/>CFG_TA_MEASURED_BOOT<br/>replays log"] -->|"extends"| PCR["PCR sha256:0"]
 ```
 
-1. **TF-A** measures BL31/BL32/BL33 into the event log (`MEASURED_BOOT=1 EVENT_LOG_LEVEL=20 TPM_HASH_ALG=sha256 MBEDTLS_DIR=…`). QEMU's `plat/qemu/qemu/qemu_measured_boot.c` maps every image to `PCR_0`.
-2. **OP-TEE core** reads the event log handed off by TF-A and forwards it to the fTPM (`CFG_DT=y CFG_CORE_TPM_EVENT_LOG=y`).
-3. **fTPM** replays the log to extend the PCRs (`CFG_TA_MEASURED_BOOT`, already on by default).
+1. **TF-A measures the boot images** — BL31, **BL32 (OP-TEE core)**, BL33 — into the TCG event log (`MEASURED_BOOT=1 EVENT_LOG_LEVEL=20 TPM_HASH_ALG=sha256`). `plat/qemu/qemu/qemu_measured_boot.c` maps every image to `PCR_0`.
+2. **TF-A hands the log to OP-TEE** by writing an `arm,tpm_event_log` node (`tpm_event_log_sm_addr` + `tpm_event_log_size`) into the `TOS_FW_CONFIG` manifest DTB. *Upstream TF-A ships this as an empty stub for `SPD=spmd`; the project supplies `project/patches/tfa-tos-fw-config-eventlog.patch` to implement it (`qemu_set_tos_fw_info()`) — without it PCR0 would stay all-zero even under FF-A.*
+3. **OP-TEE core** (the S-EL1 SPMC) reads the log from its manifest DT (`get_manifest_dt()`, enabled by `CFG_CORE_FFA=y`, which `CFG_CORE_SEL1_SPMC=y` auto-forces, plus `CFG_CORE_TPM_EVENT_LOG=y`) and forwards it to the fTPM.
+4. **The fTPM** (`CFG_TA_MEASURED_BOOT`) replays the log, extending **PCR sha256:0** — before Linux userspace ever runs.
 
-These flags are applied by `scripts/sync-project.sh` patching the generated `qemu_v8.mk`.
+The topology switch and the TF-A patch are applied by `scripts/sync-project.sh` (it flips the `qemu_v8.mk` `SPMC_AT_EL` default to `1` and `git apply`s the patch). `SPMC_AT_EL` is a single source of truth read by both the build and the run, keeping the built firmware and the QEMU launch topology in lockstep.
 
-### The current QEMU reality (⚠️ software stand-in)
+### What is and isn't measured
 
-> **Caveat — read this.** On the actual build (opteed / non-FFA SPD) the last hop of the chain does not complete. OP-TEE core reads the event log from the **Normal-World device tree** (`get_external_dt()` in the non-FFA path), but TF-A never populates the `arm,tpm_event_log` node there. Core logs `TPM: Fail to find TPM node` / `TPM Event log size: 0 Bytes`, the fTPM extends nothing, and PCR 0 would stay all-zero.
+- **Measured into PCR0:** the firmware / secure-world TCB — the TF-A stages and **OP-TEE core (BL32)**, plus BL33. Any change to these → different PCR0 → attestation rejected.
+- **Not measured:** the Linux kernel + rootfs (the chain isn't extended into U-Boot/Linux), and the **Normal-World Host binary** (`optee_example_confidential_iot_edge`). The Host is *untrusted by design* — all security gates live in the TA — so this is consistent with the threat model ([§17](#17-threat-model--security-guarantees)).
+- **TA integrity is covered transitively, not by PCR0 directly:** OP-TEE core verifies every TA's signature before loading it (see [§14](#14-what-code-is-signed--how-integrity-is-guaranteed)); because OP-TEE core is itself measured, that guarantee is rooted in PCR0.
 
-To make attestation meaningful today, `provision-device.sh:software_measure_pcr0` provides a **Normal-World software stand-in**: once per boot, *while PCR 0 is still all-zero*, it runs `tpm2_pcrextend "0:sha256=<sha256sum>"` over a fixed-order artifact list:
+Because the fTPM replays the log at boot (and PCRs zero on power-on), PCR0 is populated automatically every boot — deterministic across reboots of the same image, different if any measured firmware image changes. `provision-device.sh` simply reads it (`tpm2_pcrread sha256:0`) as the enrollment baseline.
 
-1. the `confidential_iot` TA binary (`/lib/optee_armtz/7d9f6d20-…-0001.ta`)
-2. the edge Host binary (`/usr/bin/optee_example_confidential_iot_edge`)
-
-The guard on "PCR0 still zero" makes it idempotent within a boot and auto-defers to real firmware measured boot if that ever starts extending PCR0. The result: PCR0 is non-zero, **identical across reboots of the same image, and different if either measured artifact is tampered**. This is enough to demonstrate the end-to-end attestation and integrity check, but it is **not hardware-rooted** — see [§18](#18-known-limitations--security-caveats).
-
-Because PCRs zero on power-on, `provision-device.sh` must run **every boot** to re-extend PCR0. `run-project.sh` auto-invokes it, retrying every 5 s up to ~90 s (the fTPM device node isn't usable the instant Linux boots).
+> **Historical note.** An earlier revision used a Normal-World software stand-in (`provision-device.sh:software_measure_pcr0`, which ran `tpm2_pcrextend` over the TA + Host binaries from userspace) because the previous `opteed` topology never delivered the event log to the fTPM (core logged `TPM: Fail to find TPM node`). That stand-in was **not hardware-rooted** — a compromised OS could extend the "good" hashes while running tampered code — and has been **removed** in favour of the real chain above. See [§18](#18-known-limitations--security-caveats) for what remains outside the measurement.
 
 ---
 
@@ -680,7 +680,7 @@ The integrity guarantee for the **firmware/code** is item #3, and it hangs off t
 
 ```mermaid
 flowchart LR
-    MB["Measured boot / stand-in<br/>hashes the code artifacts"] --> PCR["PCR sha256:0<br/>= identity of the running code"]
+    MB["Measured boot (TF-A)<br/>measures BL31 / BL32=OP-TEE / BL33"] --> PCR["PCR sha256:0<br/>= identity of the firmware TCB"]
     PCR --> QUOTE["TPM quote<br/>AK signs PCR0 + transcript"]
     QUOTE --> VER["Server verifies:<br/>(a) PCR bound to quote<br/>(b) AK signature<br/>(c) transcript fresh<br/>(d) == expected_pcr baseline"]
     VER --> GATE{"all 4 pass?"}
@@ -691,14 +691,13 @@ flowchart LR
     style REJECT fill:#ffebee,stroke:#c62828
 ```
 
-Concretely, **the code whose integrity is signed and guaranteed** is exactly what gets measured into PCR 0:
+**What PCR0 measures** (see [§8](#8-measured-boot-pcr--the-ftpm)): the firmware / secure-world TCB — the TF-A stages and **OP-TEE core (BL32)**, plus BL33 — measured by TF-A as each image loads, *before* control transfers to it, and extended into PCR0 by the fTPM.
 
-- **Target (hardware) chain:** TF-A boot stages (BL31/BL32/BL33), measured by TF-A, extended into PCR0 via the fTPM.
-- **Current (implemented) stand-in:** the **`confidential_iot` TA binary** and the **edge Host binary**, hashed by `provision-device.sh` and extended into PCR0.
+**How the TAs are covered.** The `confidential_iot` TA and the fTPM TA are *not* boot images, so they aren't in PCR0 directly. Instead, **OP-TEE core verifies every TA's signature before loading it**, using a verification key embedded in OP-TEE core. Because OP-TEE core is itself measured into PCR0, the chain closes: authentic OP-TEE (proven by PCR0) → loads only a validly-signed, unmodified TA → so **TA integrity is guaranteed transitively, rooted in PCR0**. A tampered `.ta` either fails signature verification and won't load, or (if the trusted key were swapped) changes OP-TEE core and therefore PCR0.
 
-Because the AK is a *restricted* fTPM key, it can only ever sign a real quote over the real PCRs — the Host cannot forge one. Because check (d) compares the quote's PCR digest to the enrollment baseline, **any change to a measured artifact changes PCR0, breaks the match, and the server refuses to derive a session key.** No key ⇒ no data is ever accepted. That is the integrity guarantee.
+Because the AK is a *restricted* fTPM key, it can only ever sign a real quote over the real PCRs — the Host cannot forge one. Because check (d) compares the quote's PCR digest to the enrollment baseline, **any change to a measured firmware image changes PCR0, breaks the match, and the server refuses to derive a session key.** No key ⇒ no data is ever accepted. That is the integrity guarantee.
 
-> Honesty note: today the measurement is a Normal-World stand-in, so the "code hasn't changed" guarantee is only as strong as the assumption that the measuring step itself ran on untampered code. See [§18](#18-known-limitations--security-caveats). The protocol, verification, and key handling above are the real, final design; only the *root* of the measurement is currently simulated.
+> Honesty note: the measurement is now rooted in the (emulated) boot firmware — TF-A measures each image *before* executing it, so the thing measured **is** the thing that runs. Two residual limitations remain: the **Linux kernel/rootfs and the untrusted Normal-World Host binary are not measured**, and the transitive TA guarantee is only as strong as the **TA signing key** (currently OP-TEE's shipped default dev key). See [§18](#18-known-limitations--security-caveats).
 
 ---
 
@@ -795,7 +794,10 @@ Applied at three layers, each enforced inside a boundary the adversary can't cro
 
 > These are stated plainly because this document is meant to be honest about what is *real* vs. *simulated*. None of them changes the protocol design; they are properties of the QEMU/dev environment.
 
-1. **PCR 0 is a Normal-World software stand-in, not hardware-rooted.** On the current opteed/non-FFA QEMU build, the TF-A → OP-TEE → fTPM event-log handoff does not complete (`get_external_dt()` has no `arm,tpm_event_log` node; core logs `TPM: Fail to find TPM node`). So `provision-device.sh` extends PCR0 from Normal World. A Normal-World attacker could, in principle, extend the "good" hashes while running tampered code. Real hardware would use the full TF-A measured-boot chain ([§8](#8-measured-boot-pcr--the-ftpm)); the flags for it (`MEASURED_BOOT=1`, `CFG_CORE_TPM_EVENT_LOG=y`, `CFG_TA_MEASURED_BOOT`) are already in place, only the DT handoff is missing.
+1. **Measured boot is real now, but its coverage and root have limits.** PCR0 reflects the actual firmware boot chain (TF-A stages + OP-TEE core), delivered via the FF-A / S-EL1 SPMC topology and `project/patches/tfa-tos-fw-config-eventlog.patch` ([§8](#8-measured-boot-pcr--the-ftpm)). Three honest residuals remain:
+   - **Coverage stops at the firmware.** The Linux kernel and rootfs are **not** measured (the chain isn't extended into U-Boot/Linux via, e.g., IMA/dm-verity), and the untrusted Normal-World Host binary is **not** measured (acceptable — it's outside the TCB by design; all gates live in the TA).
+   - **TA integrity depends on the signing key.** TAs are covered transitively via OP-TEE's signed-TA loading, but this build uses OP-TEE's **shipped default development key** (`TA_SIGN_KEY ?= keys/default_ta.pem`). Anyone with the public OP-TEE tree can re-sign a tampered TA with it. For the transitive guarantee to be robust, sign TAs with a **private** key (set `TA_SIGN_KEY`) — a straightforward hardening, out of scope here.
+   - **The root of trust is emulated.** On QEMU there is no immutable BootROM or fused key; TF-A itself is the measurement root. It is "firmware-rooted" in that the *measurer* is the boot firmware (not the untrusted OS), but not silicon-rooted.
 2. **Automatic rebuild-reset of TOFU/AK is a dev convenience.** It is deliberately coupled to a full disk wipe (new AK) so it can't be a quiet bypass, but on real hardware re-pinning would be operator-controlled, not automatic.
 3. **First-come-first-served self-registration.** Nothing stops a fake device pre-registering a made-up `device_id`. The only guarantee is *no silent takeover of an already-registered ID*. Real deployments would gate enrollment behind an authority.
 4. **QEMU stable HUK / EPS.** The Hardware Unique Key and Endorsement Primary Seed are stable software values under emulation — they are *not* real secrets. This is what makes secure storage decryptable across reboots in the first place, but it means the roots of trust are simulation-grade.
