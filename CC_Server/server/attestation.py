@@ -29,6 +29,14 @@ Verification performed on the attest_response (see `verify_and_derive`):
      session's nonce or ephemeral keys).
   d. Compare the verified PCR digest against the registry's expected_pcr
      baseline (integrity - was this the registered, untampered device).
+  e. Verify `ta_sig` against the TA identity key pinned at registration
+     (docs/HANDOFF_taIdentityBinding.md). Checks a-d prove the *device* and
+     its *firmware*, but not that the genuine TA did the crypto: the AK
+     belongs to the fTPM and the quote is assembled by the untrusted Host, so
+     root could bypass the TA entirely - run its own ECDH in Normal World and
+     have the fTPM quote that key, with a real AK over a real PCR0. Only the
+     genuine TA holds the ECDSA key sealed in OP-TEE secure storage, so only
+     it can sign this session's ephemeral public key.
 
 On success, derives the AES-256-GCM session key via ECDH + HKDF exactly like
 the User<->Server AES-GCM channel (crypto.py), just with a distinct info
@@ -70,6 +78,19 @@ TPM_ALG_ECDSA = 0x0018
 # (cross-protocol signature confusion). MUST equal the TA's
 # TA_CONFIDENTIAL_IOT_SERVER_IDENTITY_LABEL byte for byte (no NUL terminator).
 SERVER_IDENTITY_LABEL = b"CC-IOT-1 server-identity"
+
+# Domain-separation label for the TA-identity signature - the mirror image of
+# the one above: there the server proves itself to the device, here the TA
+# proves itself to the server (docs/HANDOFF_taIdentityBinding.md §4c).
+#
+# "CC-IOT-1" is this protocol's VERSION prefix, not a per-device counter -
+# compare INFO_DEVICE_AEAD ("CC-IOT-1 device-aead") and the label above, which
+# are the same version with different purposes. Per-device binding comes from
+# device_id inside the pre-image (see build_ta_identity_preimage).
+#
+# MUST equal the TA's TA_CONFIDENTIAL_IOT_TA_IDENTITY_LABEL byte for byte; the
+# TA hashes it as sizeof(label) - 1, i.e. WITHOUT the C NUL terminator.
+TA_IDENTITY_LABEL = b"CC-IOT-1 ta-identity"
 
 
 class AttestationError(ValueError):
@@ -147,6 +168,7 @@ class AttestationVerifier:
         quote_b64: str,
         signature_b64: str,
         pcr_values_text: str,
+        ta_sig_b64: str,
     ) -> bytes:
         """Raises AttestationError on any failed check; otherwise stores the
         derived session key for `device_id` (see `session_key`) and returns the
@@ -162,12 +184,25 @@ class AttestationVerifier:
         if time.time() - pending.issued_at > C.ATTEST_CHALLENGE_TTL_SECONDS:
             raise AttestationError("attestation challenge expired")
 
-        device_ecdh_pub = crypto.b64d(device_ecdh_pub_b64)
+        # Decode every base64 field behind AttestationError. crypto.b64d raises
+        # binascii.Error, which attested_network.py's handler does not catch, so
+        # a malformed field would otherwise drop the TCP connection instead of
+        # returning attest_result{ok:false}. AttributeError covers a null or
+        # non-string field in a malformed attest_response.
+        try:
+            device_ecdh_pub = crypto.b64d(device_ecdh_pub_b64)
+            quote_raw = crypto.b64d(quote_b64)
+            sig_raw = crypto.b64d(signature_b64)
+            ta_sig = crypto.b64d(ta_sig_b64)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise AttestationError(
+                f"malformed base64 in attest_response: {exc}"
+            ) from exc
+
         if len(device_ecdh_pub) != C.DEVICE_ECDH_PUBKEY_LEN:
             raise AttestationError("bad device_ecdh_pub length")
-
-        quote_raw = crypto.b64d(quote_b64)
-        sig_raw = crypto.b64d(signature_b64)
+        if len(ta_sig) != C.TA_IDENTITY_SIG_LEN:
+            raise AttestationError("bad ta_sig length")
 
         attest = parse_tpms_attest(quote_raw)
         r, s = parse_tpmt_signature_ecdsa(sig_raw)
@@ -200,6 +235,47 @@ class AttestationVerifier:
         expected_digest = recompute_pcr_digest(record.expected_pcr)
         if recomputed_pcr_digest != expected_digest:
             raise AttestationError("PCR values do not match the registered baseline")
+
+        # (e) TA identity: only the genuine TA holds the ECDSA P-256 key sealed
+        # in OP-TEE secure storage and pinned at registration, so only it can
+        # sign this session's labelled, device-bound transcript. That is what
+        # makes device_ecdh_pub provably the TA's ephemeral key rather than one
+        # a root-compromised Normal World substituted while bypassing the TA
+        # entirely (checks a-d would all still pass in that case — real AK,
+        # real PCR0). Runs BEFORE any key derivation: a failure must leave no
+        # session behind. See docs/HANDOFF_taIdentityBinding.md.
+        if not record.ta_pub_b64:
+            raise AttestationError(
+                "device has no enrolled TA identity key — remove it with "
+                "scripts/reset-device-registry.sh, restart the server, and let "
+                "the device re-provision"
+            )
+        try:
+            ta_pub = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(), crypto.b64d(record.ta_pub_b64)
+            )
+        except (ValueError, TypeError) as exc:
+            raise AttestationError("registered TA identity key is unusable") from exc
+
+        ta_pre_image = build_ta_identity_preimage(
+            device_id, pending.nonce, pending.server_pub, device_ecdh_pub
+        )
+        try:
+            ta_pub.verify(
+                encode_dss_signature(
+                    int.from_bytes(ta_sig[:32], "big"),
+                    int.from_bytes(ta_sig[32:], "big"),
+                ),
+                # The PRE-IMAGE, not compute_ta_identity_msg(). The TA signs
+                # SHA-256(pre_image) via TEE_AsymmetricSignDigest, and
+                # cryptography hashes whatever message it is handed — so
+                # passing the digest here would hash twice and reject every
+                # genuine signature.
+                ta_pre_image,
+                ec.ECDSA(hashes.SHA256()),
+            )
+        except InvalidSignature as exc:
+            raise AttestationError("TA identity verification failed") from exc
 
         # All checks passed: derive the session key exactly like the
         # browser<->server AES-GCM channel, just with a distinct info label.
@@ -267,6 +343,57 @@ def compute_transcript_hash(nonce: bytes, server_pub: bytes, device_pub: bytes) 
     """SHA-256(nonce || server_ecdh_pub || device_ecdh_pub) - must match the
     Host CA's edge_attest_to_server() computation exactly, byte for byte."""
     return hashlib.sha256(nonce + server_pub + device_pub).digest()
+
+
+def build_ta_identity_preimage(
+    device_id: str, nonce: bytes, server_pub: bytes, device_pub: bytes
+) -> bytes:
+    """The exact bytes the TA hashes and signs with its sealed identity key:
+
+        TA_IDENTITY_LABEL   (20, fixed - no NUL, matching sizeof(label) - 1)
+     || nonce               (ATTEST_NONCE_LEN = 32, fixed)
+     || server_ecdh_pub     (DEVICE_ECDH_PUBKEY_LEN = 65, fixed)
+     || device_ecdh_pub     (DEVICE_ECDH_PUBKEY_LEN = 65, fixed)
+     || device_id           (UTF-8, no NUL, NO length prefix, VARIABLE - LAST)
+
+    Binding device_ecdh_pub is the crux: it forces this session's ECDH key to be
+    the genuine TA's, since root cannot sign a substitute key. The nonce gives
+    freshness, and device_id binds the signature to one enrolled device.
+
+    device_id goes last and unprefixed on purpose. It is the only
+    variable-length field, so putting it last keeps the encoding injective for
+    any field lengths, with no length prefix that the C and Python sides would
+    both have to agree on. It also lets the TA reuse the server-identity digest
+    sequence it already implements with a single extra TEE_DigestUpdate.
+
+    Must match sign_ta_identity() in the TA byte for byte — see
+    tests/test_attestation.py::test_ta_identity_preimage_is_byte_exact.
+    """
+    return (
+        TA_IDENTITY_LABEL
+        + nonce
+        + server_pub
+        + device_pub
+        + device_id.encode("utf-8")
+    )
+
+
+def compute_ta_identity_msg(
+    device_id: str, nonce: bytes, server_pub: bytes, device_pub: bytes
+) -> bytes:
+    """SHA-256 of build_ta_identity_preimage() — the 32-byte digest the TA hands
+    to TEE_AsymmetricSignDigest. Mirrors compute_transcript_hash(), but labelled
+    and device-bound so a TA signature can never be confused with the fTPM
+    quote's qualifying data over the same session.
+
+    DO NOT pass this to EllipticCurvePublicKey.verify(..., ec.ECDSA(SHA256())):
+    that hashes its argument, so handing it this digest hashes twice and rejects
+    every genuine signature. Verify over the PRE-IMAGE (what verify_and_derive
+    does), or pass this digest with ec.ECDSA(utils.Prehashed(hashes.SHA256())).
+    """
+    return hashlib.sha256(
+        build_ta_identity_preimage(device_id, nonce, server_pub, device_pub)
+    ).digest()
 
 
 # ---------------------------------------------------------------------------

@@ -64,5 +64,7 @@ TEE_Result ta_generate_attestation_evidence(struct confidential_iot_session *ses
 					    TEE_Param params[4]);
 TEE_Result ta_handshake_complete(struct confidential_iot_session *sess,
 				 uint32_t param_types, TEE_Param params[4]);
+TEE_Result ta_generate_ta_identity(struct confidential_iot_session *sess,
+				   uint32_t param_types, TEE_Param params[4]);
 
 #endif /* TRUSTED_APP_H */

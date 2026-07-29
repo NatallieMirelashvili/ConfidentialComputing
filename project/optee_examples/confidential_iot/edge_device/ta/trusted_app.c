@@ -7,10 +7,12 @@
 #include <pta_sensor_link.h>
 
 /*
- * Read a P-256 coordinate attribute into a fixed 32-byte, left-zero-padded
- * big-endian buffer. GP implementations may return the minimal-length
- * encoding (dropping leading zero bytes), so we can't assume the returned
- * length is always 32.
+ * Read a P-256 coordinate OR private scalar attribute into a fixed 32-byte,
+ * left-zero-padded big-endian buffer. GP implementations may return the
+ * minimal-length encoding (dropping leading zero bytes), so we can't assume the
+ * returned length is always 32. This applies equally to
+ * TEE_ATTR_ECC_PRIVATE_VALUE, which the TA-identity sealing path below reads
+ * the same way.
  */
 static TEE_Result read_ec_coordinate(TEE_ObjectHandle obj, uint32_t attr_id,
 				     uint8_t out[32])
@@ -215,6 +217,303 @@ out_wipe_secret:
  * over public data only; it is computed here rather than in the Host so
  * that Normal World never needs its own SHA-256 implementation.
  */
+/* ---- TA identity (docs/HANDOFF_taIdentityBinding.md) --------------------- *
+ *
+ * The TA owns an ECDSA P-256 keypair generated inside the TEE and sealed in
+ * secure storage, together with the device_id it is bound to. Signing this
+ * session's ephemeral ECDH public key with it is what proves the key belongs
+ * to the genuine TA - closing the bypass where root in Normal World runs its
+ * own crypto, has the fTPM quote its own key (real AK, real PCR0), and the
+ * server cannot tell the difference.
+ *
+ * Blob layout is documented at TA_CONFIDENTIAL_IOT_TA_IDENTITY_OBJID in
+ * confidential_iot_ta.h. Offsets used here:
+ */
+#define TA_ID_OFF_D	0
+#define TA_ID_OFF_X	(TA_ID_OFF_D + TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE)
+#define TA_ID_OFF_Y	(TA_ID_OFF_X + TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE)
+#define TA_ID_OFF_IDLEN	(TA_ID_OFF_Y + TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE)
+#define TA_ID_OFF_ID	(TA_ID_OFF_IDLEN + 1)
+
+/* Emit the sealed public half as an uncompressed SEC1 point, 0x04 || X || Y. */
+static void ta_identity_blob_to_sec1(const uint8_t *blob, uint8_t *out65)
+{
+	out65[0] = 0x04;
+	TEE_MemMove(out65 + 1, blob + TA_ID_OFF_X,
+		    TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE);
+	TEE_MemMove(out65 + 1 + TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE,
+		    blob + TA_ID_OFF_Y, TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE);
+}
+
+/*
+ * Load the sealed identity blob and sanity-check its shape. The caller owns
+ * `blob` (which holds the PRIVATE key) and must wipe it.
+ *
+ * Returns TEE_ERROR_ITEM_NOT_FOUND when nothing has been sealed yet, so callers
+ * can distinguish "not provisioned" from a real storage failure.
+ */
+static TEE_Result read_ta_identity_blob(uint8_t blob[TA_CONFIDENTIAL_IOT_TA_IDENTITY_BLOB_SIZE])
+{
+	TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+	size_t len = TA_CONFIDENTIAL_IOT_TA_IDENTITY_BLOB_SIZE;
+	TEE_Result res;
+
+	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE,
+				       TA_CONFIDENTIAL_IOT_TA_IDENTITY_OBJID,
+				       strlen(TA_CONFIDENTIAL_IOT_TA_IDENTITY_OBJID),
+				       TEE_DATA_FLAG_ACCESS_READ, &obj);
+	if (res != TEE_SUCCESS)
+		return res; /* includes TEE_ERROR_ITEM_NOT_FOUND */
+
+	res = TEE_ReadObjectData(obj, blob, len, &len);
+	TEE_CloseObject(obj);
+	if (res != TEE_SUCCESS)
+		return res;
+
+	if (len != TA_CONFIDENTIAL_IOT_TA_IDENTITY_BLOB_SIZE ||
+	    blob[TA_ID_OFF_IDLEN] == 0 ||
+	    blob[TA_ID_OFF_IDLEN] > TA_CONFIDENTIAL_IOT_DEVICE_ID_MAX)
+		return TEE_ERROR_BAD_STATE;
+
+	return TEE_SUCCESS;
+}
+
+/*
+ * Sign this session's ephemeral ECDH public key with the sealed TA identity
+ * key, domain-separated and bound to the sealed device_id:
+ *
+ *   ta_identity_msg = SHA-256(label || nonce || server_ecdh_pub ||
+ *                             device_ecdh_pub || device_id)
+ *   ta_sig          = ECDSA-P256(ta_identity_priv, ta_identity_msg)  raw r||s
+ *
+ * device_id goes LAST because it is the only variable-length field: with every
+ * other field fixed-length and ahead of it, the encoding stays unambiguous
+ * whatever those lengths become, without a length prefix that the C and Python
+ * sides would both have to agree on. Must match
+ * build_ta_identity_preimage() in CC_Server/server/attestation.py byte for byte.
+ *
+ * This is the mirror image of authenticate_server() above: same labelled-digest
+ * shape, but this TA signs rather than verifies.
+ *
+ * All inputs must already be TA-LOCAL copies - see the caller.
+ */
+static TEE_Result sign_ta_identity(const uint8_t *nonce, size_t nonce_len,
+				   const uint8_t *server_ecdh_pub,
+				   const uint8_t *device_pub,
+				   uint8_t sig[TA_CONFIDENTIAL_IOT_TA_SIG_SIZE])
+{
+	static const char label[] = TA_CONFIDENTIAL_IOT_TA_IDENTITY_LABEL;
+	TEE_Result res;
+	TEE_OperationHandle digest_op = TEE_HANDLE_NULL;
+	TEE_OperationHandle sign_op = TEE_HANDLE_NULL;
+	TEE_ObjectHandle key = TEE_HANDLE_NULL;
+	TEE_Attribute attrs[4];
+	uint8_t blob[TA_CONFIDENTIAL_IOT_TA_IDENTITY_BLOB_SIZE];
+	uint8_t digest[TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE];
+	size_t digest_len = sizeof(digest);
+	size_t sig_len = TA_CONFIDENTIAL_IOT_TA_SIG_SIZE;
+	uint8_t nonzero = 0;
+	size_t i;
+
+	res = read_ta_identity_blob(blob);
+	if (res == TEE_ERROR_ITEM_NOT_FOUND) {
+		/* No identity sealed: provisioning (CMD 6) never ran. */
+		res = TEE_ERROR_BAD_STATE;
+		goto out;
+	}
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	/*
+	 * Corruption guard. TEE_AsymmetricSignDigest() PANICS on any error
+	 * other than TEE_ERROR_SHORT_BUFFER, so a malformed private scalar
+	 * would kill the TA instead of returning here - and an all-zero scalar
+	 * is the shape a truncated/zeroed storage object takes. Cheap to check,
+	 * and it turns an opaque "TA panicked" into a clean TEE_ERROR_BAD_STATE.
+	 */
+	for (i = 0; i < TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE; i++)
+		nonzero |= blob[TA_ID_OFF_D + i];
+	if (!nonzero) {
+		res = TEE_ERROR_BAD_STATE;
+		goto out;
+	}
+
+	res = TEE_AllocateOperation(&digest_op, TEE_ALG_SHA256, TEE_MODE_DIGEST, 0);
+	if (res != TEE_SUCCESS)
+		goto out;
+	TEE_DigestUpdate(digest_op, label, sizeof(label) - 1); /* no NUL */
+	TEE_DigestUpdate(digest_op, nonce, nonce_len);
+	TEE_DigestUpdate(digest_op, server_ecdh_pub,
+			 TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE);
+	TEE_DigestUpdate(digest_op, device_pub,
+			 TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE);
+	res = TEE_DigestDoFinal(digest_op, blob + TA_ID_OFF_ID,
+				blob[TA_ID_OFF_IDLEN], digest, &digest_len);
+	TEE_FreeOperation(digest_op);
+	digest_op = TEE_HANDLE_NULL;
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	/*
+	 * Reload the sealed keypair. TEE_TYPE_ECDSA_KEYPAIR requires all four
+	 * attributes; the public half is stored alongside the scalar so we never
+	 * have to recompute the point.
+	 */
+	TEE_InitRefAttribute(&attrs[0], TEE_ATTR_ECC_PRIVATE_VALUE,
+			     blob + TA_ID_OFF_D,
+			     TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE);
+	TEE_InitRefAttribute(&attrs[1], TEE_ATTR_ECC_PUBLIC_VALUE_X,
+			     blob + TA_ID_OFF_X,
+			     TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE);
+	TEE_InitRefAttribute(&attrs[2], TEE_ATTR_ECC_PUBLIC_VALUE_Y,
+			     blob + TA_ID_OFF_Y,
+			     TA_CONFIDENTIAL_IOT_EC_SCALAR_SIZE);
+	TEE_InitValueAttribute(&attrs[3], TEE_ATTR_ECC_CURVE,
+			       TEE_ECC_CURVE_NIST_P256, 0);
+
+	res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR, 256, &key);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = TEE_PopulateTransientObject(key, attrs, 4);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	res = TEE_AllocateOperation(&sign_op, TEE_ALG_ECDSA_P256,
+				    TEE_MODE_SIGN, 256);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = TEE_SetOperationKey(sign_op, key);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	/* The output buffer is always exactly 64 bytes, so SHORT_BUFFER - the
+	 * one error this call returns rather than panicking on - cannot occur. */
+	res = TEE_AsymmetricSignDigest(sign_op, NULL, 0, digest, sizeof(digest),
+				       sig, &sig_len);
+	if (res == TEE_SUCCESS && sig_len != TA_CONFIDENTIAL_IOT_TA_SIG_SIZE)
+		res = TEE_ERROR_BAD_STATE;
+
+out:
+	TEE_FreeOperation(digest_op);
+	TEE_FreeOperation(sign_op);
+	TEE_FreeTransientObject(key);
+	TEE_MemFill(blob, 0, sizeof(blob)); /* holds the private scalar */
+	return res;
+}
+
+TEE_Result ta_generate_ta_identity(struct confidential_iot_session __unused *sess,
+				   uint32_t param_types, TEE_Param params[4])
+{
+	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+						 TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						 TEE_PARAM_TYPE_NONE,
+						 TEE_PARAM_TYPE_NONE);
+	TEE_Result res;
+	TEE_ObjectHandle keypair = TEE_HANDLE_NULL;
+	TEE_ObjectHandle obj = TEE_HANDLE_NULL;
+	TEE_Attribute curve_attr;
+	uint8_t blob[TA_CONFIDENTIAL_IOT_TA_IDENTITY_BLOB_SIZE] = { 0 };
+	uint8_t device_id[TA_CONFIDENTIAL_IOT_DEVICE_ID_MAX];
+	size_t id_len;
+
+	if (param_types != exp_pt)
+		return TEE_ERROR_BAD_PARAMETERS;
+
+	id_len = params[0].memref.size;
+	if (id_len == 0 || id_len > TA_CONFIDENTIAL_IOT_DEVICE_ID_MAX)
+		return TEE_ERROR_BAD_PARAMETERS;
+	if (params[1].memref.size < TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE)
+		return TEE_ERROR_SHORT_BUFFER;
+
+	/* Copy out of Host-shared memory before it is compared or sealed. */
+	TEE_MemMove(device_id, params[0].memref.buffer, id_len);
+
+	/* Already sealed? Re-export (idempotent) or refuse a rebind. */
+	res = read_ta_identity_blob(blob);
+	if (res == TEE_SUCCESS) {
+		if (blob[TA_ID_OFF_IDLEN] != id_len ||
+		    TEE_MemCompare(blob + TA_ID_OFF_ID, device_id, id_len) != 0) {
+			/* Sealed under a different device_id. Rebinding would
+			 * silently break every signature this TA produces, so
+			 * fail here where the message is actionable: the fix is
+			 * to wipe the device's secure storage. */
+			res = TEE_ERROR_ACCESS_CONFLICT;
+			goto out;
+		}
+		ta_identity_blob_to_sec1(blob, params[1].memref.buffer);
+		params[1].memref.size = TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE;
+		goto out;
+	}
+	if (res != TEE_ERROR_ITEM_NOT_FOUND)
+		goto out;
+
+	/* First use: mint the keypair inside the TA. The private half never
+	 * leaves the TEE - only the 65-byte public point is ever exported. */
+	res = TEE_AllocateTransientObject(TEE_TYPE_ECDSA_KEYPAIR, 256, &keypair);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	TEE_InitValueAttribute(&curve_attr, TEE_ATTR_ECC_CURVE,
+			       TEE_ECC_CURVE_NIST_P256, 0);
+
+	res = TEE_GenerateKey(keypair, 256, &curve_attr, 1);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	/* All three are minimal-length encoded by the TEE; read_ec_coordinate
+	 * left-zero-pads each to a fixed 32 bytes. */
+	res = read_ec_coordinate(keypair, TEE_ATTR_ECC_PRIVATE_VALUE,
+				 blob + TA_ID_OFF_D);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = read_ec_coordinate(keypair, TEE_ATTR_ECC_PUBLIC_VALUE_X,
+				 blob + TA_ID_OFF_X);
+	if (res != TEE_SUCCESS)
+		goto out;
+	res = read_ec_coordinate(keypair, TEE_ATTR_ECC_PUBLIC_VALUE_Y,
+				 blob + TA_ID_OFF_Y);
+	if (res != TEE_SUCCESS)
+		goto out;
+
+	blob[TA_ID_OFF_IDLEN] = (uint8_t)id_len;
+	TEE_MemMove(blob + TA_ID_OFF_ID, device_id, id_len);
+
+	/* First-write-wins: no TEE_DATA_FLAG_OVERWRITE, same as the pinned
+	 * server key and the sensor PSK. */
+	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE,
+					 TA_CONFIDENTIAL_IOT_TA_IDENTITY_OBJID,
+					 strlen(TA_CONFIDENTIAL_IOT_TA_IDENTITY_OBJID),
+					 TEE_DATA_FLAG_ACCESS_WRITE,
+					 TEE_HANDLE_NULL, blob, sizeof(blob),
+					 &obj);
+	if (res == TEE_ERROR_ACCESS_CONFLICT) {
+		/* Raced by a concurrent provisioning call. The winner's key is
+		 * the real one, so discard ours and re-export theirs; a
+		 * device_id mismatch there is still ACCESS_CONFLICT, correctly. */
+		TEE_MemFill(blob, 0, sizeof(blob));
+		res = read_ta_identity_blob(blob);
+		if (res != TEE_SUCCESS)
+			goto out;
+		if (blob[TA_ID_OFF_IDLEN] != id_len ||
+		    TEE_MemCompare(blob + TA_ID_OFF_ID, device_id, id_len) != 0) {
+			res = TEE_ERROR_ACCESS_CONFLICT;
+			goto out;
+		}
+	} else if (res != TEE_SUCCESS) {
+		goto out;
+	} else {
+		TEE_CloseObject(obj);
+	}
+
+	ta_identity_blob_to_sec1(blob, params[1].memref.buffer);
+	params[1].memref.size = TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE;
+
+out:
+	TEE_FreeTransientObject(keypair);
+	TEE_MemFill(blob, 0, sizeof(blob)); /* holds the private scalar */
+	return res;
+}
+
 TEE_Result ta_generate_attestation_evidence(struct confidential_iot_session *sess,
 					    uint32_t param_types,
 					    TEE_Param params[4])
@@ -230,15 +529,37 @@ TEE_Result ta_generate_attestation_evidence(struct confidential_iot_session *ses
 	uint8_t y[32];
 	uint8_t *out;
 	size_t hash_len;
+	/*
+	 * TA-local copies of every byte that goes into a digest we SIGN.
+	 * params[] memrefs live in memory shared with Normal World, which a
+	 * root-compromised Host can rewrite from another thread while this
+	 * command runs. Hashing them in place would let it wait for the TA to
+	 * write 0x04||X||Y into params[0] and then swap in a public key whose
+	 * private half it holds - obtaining a genuine TA signature over an
+	 * attacker's ECDH key, which is exactly the bypass this signature
+	 * exists to prevent. authenticate_server() already works this way.
+	 */
+	uint8_t nonce[TA_CONFIDENTIAL_IOT_NONCE_MAX];
+	uint8_t server_pub[TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE];
+	uint8_t device_pub[TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE];
+	size_t nonce_len;
 
 	if (param_types != exp_pt)
 		return TEE_ERROR_BAD_PARAMETERS;
 	if (params[0].memref.size < TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE)
 		return TEE_ERROR_SHORT_BUFFER;
+	if (params[1].memref.size == 0 ||
+	    params[1].memref.size > TA_CONFIDENTIAL_IOT_NONCE_MAX)
+		return TEE_ERROR_BAD_PARAMETERS;
 	if (params[2].memref.size != TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE)
 		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[3].memref.size < TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE)
+	if (params[3].memref.size < TA_CONFIDENTIAL_IOT_EVIDENCE_BLOCK_SIZE)
 		return TEE_ERROR_SHORT_BUFFER;
+
+	nonce_len = params[1].memref.size;
+	TEE_MemMove(nonce, params[1].memref.buffer, nonce_len);
+	TEE_MemMove(server_pub, params[2].memref.buffer,
+		    TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE);
 
 	if (sess->ecdh_keypair != TEE_HANDLE_NULL) {
 		TEE_FreeTransientObject(sess->ecdh_keypair);
@@ -268,34 +589,55 @@ TEE_Result ta_generate_attestation_evidence(struct confidential_iot_session *ses
 	if (res != TEE_SUCCESS)
 		goto err_free_keypair;
 
+	/* Build the point locally first, then publish it. Everything hashed
+	 * below reads device_pub, never the shared buffer. */
+	device_pub[0] = 0x04; // its a standard prefix for uncompressed EC
+	TEE_MemMove(device_pub + 1, x, 32);
+	TEE_MemMove(device_pub + 33, y, 32);
+
 	out = params[0].memref.buffer;
-	out[0] = 0x04; // its a standard prefix for uncompressed EC 
-	TEE_MemMove(out + 1, x, 32);
-	TEE_MemMove(out + 33, y, 32);
+	TEE_MemMove(out, device_pub, TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE);
 	params[0].memref.size = TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE;
 
 	/*
 	 * transcript_hash = SHA-256(nonce || server_ecdh_pub || device_ecdh_pub)
 	 * - must match compute_transcript_hash() in the server's
-	 * attestation.py byte for byte.
+	 * attestation.py byte for byte. This is the fTPM quote's qualifying
+	 * data, and it stays exactly the first 32 bytes of the output block.
 	 */
 	res = TEE_AllocateOperation(&digest_op, TEE_ALG_SHA256,
 				    TEE_MODE_DIGEST, 0);
 	if (res != TEE_SUCCESS)
 		goto err_free_keypair;
 
-	TEE_DigestUpdate(digest_op, params[1].memref.buffer,
-			 params[1].memref.size);
-	TEE_DigestUpdate(digest_op, params[2].memref.buffer,
-			 params[2].memref.size);
-	hash_len = params[3].memref.size;
-	res = TEE_DigestDoFinal(digest_op, out,
+	TEE_DigestUpdate(digest_op, nonce, nonce_len);
+	TEE_DigestUpdate(digest_op, server_pub,
+			 TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE);
+	hash_len = TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE;
+	res = TEE_DigestDoFinal(digest_op, device_pub,
 				TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE,
 				params[3].memref.buffer, &hash_len);
 	TEE_FreeOperation(digest_op);
 	if (res != TEE_SUCCESS)
 		goto err_free_keypair;
-	params[3].memref.size = hash_len;
+	if (hash_len != TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE) {
+		res = TEE_ERROR_BAD_STATE;
+		goto err_free_keypair;
+	}
+
+	/*
+	 * Prove the ephemeral key above is THIS TA's, using the identity key
+	 * sealed at provisioning. Distinct label and a different pre-image from
+	 * the quote's qualifying data, so the two signatures can never be
+	 * confused for one another.
+	 */
+	res = sign_ta_identity(nonce, nonce_len, server_pub, device_pub,
+			       (uint8_t *)params[3].memref.buffer +
+			       TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE);
+	if (res != TEE_SUCCESS)
+		goto err_free_keypair;
+
+	params[3].memref.size = TA_CONFIDENTIAL_IOT_EVIDENCE_BLOCK_SIZE;
 
 	return TEE_SUCCESS;
 
@@ -857,6 +1199,8 @@ TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx, uint32_t cmd_id,
 		return ta_handshake_complete(sess, param_types, params);
 	case TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET:
 		return ta_provision_sensor_secret(sess, param_types, params);
+	case TA_CONFIDENTIAL_IOT_CMD_GENERATE_TA_IDENTITY:
+		return ta_generate_ta_identity(sess, param_types, params);
 	default:
 		return TEE_ERROR_NOT_SUPPORTED;
 	}

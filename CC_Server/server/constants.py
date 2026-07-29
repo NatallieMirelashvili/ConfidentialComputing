@@ -35,6 +35,19 @@ ATTEST_CHALLENGE_TTL_SECONDS = 30         # how long a device has to answer a ch
 DEVICE_ECDH_PUBKEY_LEN = 65                # uncompressed P-256 SEC1 point (0x04 || X || Y)
 
 # ---------------------------------------------------------------------------
+# TA identity binding (see attestation.py, docs/HANDOFF_taIdentityBinding.md).
+# The TA's sealed ECDSA P-256 identity key: the public half uses the same
+# 65-byte uncompressed SEC1 encoding as the ECDH keys, and the signature is
+# raw r||s. Mirrors TA_CONFIDENTIAL_IOT_TA_SIG_SIZE in confidential_iot_ta.h.
+# ---------------------------------------------------------------------------
+TA_IDENTITY_PUBKEY_LEN = 65
+TA_IDENTITY_SIG_LEN = 64
+# Max device_id length in bytes. device_id is hashed into the TA-identity
+# pre-image on both sides, and the TA holds it in a fixed-size sealed buffer -
+# MUST equal TA_CONFIDENTIAL_IOT_DEVICE_ID_MAX in confidential_iot_ta.h.
+DEVICE_ID_MAX_LEN = 63
+
+# ---------------------------------------------------------------------------
 # Application values
 # ---------------------------------------------------------------------------
 WINDOWS = {"1h": 3600, "24h": 86400}     # user-selectable window -> length in seconds

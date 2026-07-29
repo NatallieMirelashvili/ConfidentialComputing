@@ -57,6 +57,53 @@ static int provision_sensor_secret_mode(const char *b64)
 	return ret;
 }
 
+/*
+ * One-time provisioning mode: `optee_example_confidential_iot_edge
+ * --provision-ta-identity` mints (first call) or re-exports (later calls) this
+ * TA's sealed identity public key and prints it base64-encoded to stdout.
+ *
+ * stdout carries the key AND NOTHING ELSE, because scripts/provision-device.sh
+ * captures it with $(...) to build the enrollment record; every human-facing
+ * message goes to stderr. Takes no argument - the device_id is read from
+ * /etc/confidential_iot/device.conf (see load_config in edge_device.c), which
+ * guarantees the identity the TA seals is byte-identical to the one the server
+ * looks the key up by. See docs/HANDOFF_taIdentityBinding.md.
+ */
+static int provision_ta_identity_mode(void)
+{
+	uint8_t pub[TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE];
+	char b64[128];
+	size_t olen;
+	int ret = 1;
+
+	if (edge_device_init() != 0) {
+		fprintf(stderr, "edge_device: init failed\n");
+		return 1;
+	}
+
+	if (edge_provision_ta_identity(pub) != 0) {
+		fprintf(stderr,
+			"edge_device: TA identity provisioning failed.\n"
+			"             If this device was previously provisioned under a\n"
+			"             DIFFERENT device_id, its sealed TA identity is bound to\n"
+			"             that id - wipe the device's secure storage to rebind.\n");
+		goto out;
+	}
+
+	if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &olen,
+				   pub, sizeof(pub)) != 0) {
+		fprintf(stderr, "edge_device: base64 encoding failed\n");
+		goto out;
+	}
+
+	printf("%s\n", b64);
+	ret = 0;
+
+out:
+	edge_device_shutdown();
+	return ret;
+}
+
 int main(int argc, char *argv[])
 {
 	/* base64(nonce(12) || ciphertext || tag(16)) needs ~4/3 expansion -
@@ -69,6 +116,9 @@ int main(int argc, char *argv[])
 
 	if (argc == 3 && strcmp(argv[1], "--provision-sensor-secret") == 0)
 		return provision_sensor_secret_mode(argv[2]);
+
+	if (argc == 2 && strcmp(argv[1], "--provision-ta-identity") == 0)
+		return provision_ta_identity_mode();
 
 	if (edge_device_init() != 0) {
 		fprintf(stderr, "edge_device: init failed\n");

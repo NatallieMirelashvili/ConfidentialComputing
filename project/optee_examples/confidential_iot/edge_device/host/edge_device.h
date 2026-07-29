@@ -41,6 +41,24 @@ int edge_authenticate_sensor(void);
 int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE]);
 
 /*
+ * One-time provisioning trigger for the TA's OWN identity keypair - see
+ * scripts/provision-device.sh, which drives this and puts the returned public
+ * key in the enrollment record the server pins alongside the AK. Writes the
+ * 65-byte uncompressed SEC1 point (0x04 || X || Y) to `out_pub`.
+ *
+ * The private half is generated inside the TA and never leaves the TEE; that is
+ * the property root cannot defeat, and it is what proves to the server that the
+ * genuine TA - not a bypassed Normal World - produced a session's ECDH key.
+ *
+ * Idempotent: the first call mints and seals the key, later calls re-export the
+ * same point, so this is safe to run on every boot. The device_id is taken from
+ * device.conf (or CIOT_DEVICE_ID), not from an argument, and is sealed with the
+ * key. Re-provisioning under a DIFFERENT device_id fails; rebinding requires
+ * wiping the device's secure storage. Returns 0 on success.
+ */
+int edge_provision_ta_identity(uint8_t out_pub[TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE]);
+
+/*
  * Ensures there is a live attested session with the server, (re)running
  * attestation + handshake if none exists yet or the previous one has expired
  * (device-driven attestation: the device re-attests on expiry rather than the
@@ -60,8 +78,10 @@ void edge_reset_connection(void);
  * management server's device-facing port, sends "hello", receives
  * "attest_challenge" (nonce + server ephemeral ECDH pubkey + the server's
  * identity pubkey), asks our own TA (CMD_GENERATE_ATTESTATION_EVIDENCE) for a
- * fresh ephemeral ECDH pubkey, gets that pubkey quoted by the fTPM over the
- * transcript hash, sends "attest_response", and waits for "attest_result"
+ * fresh ephemeral ECDH pubkey plus that TA's identity signature over the
+ * session, gets the pubkey quoted by the fTPM over the
+ * transcript hash, sends "attest_response" (quote + signature + pcr_values +
+ * ta_sig), and waits for "attest_result"
  * (which, on success, also carries the server's per-session identity
  * signature). Leaves the TCP connection open (reused by edge_handshake and
  * edge_send_sensor_data_to_server) and the nonce / server ECDH pubkey /

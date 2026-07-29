@@ -1,16 +1,18 @@
 {
-  "iot-edge-01": {
-    "device_id": "iot-edge-01",
-    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfHfIfUfABv9V/r5cEzEXgo76OV2C\n7GIo6sQhZaRz0oapi3hTFB3BA+o+seTIakLRYTRviY97XYtAYTetU6haaw==\n-----END PUBLIC KEY-----\n",
-    "expected_pcr": "  sha256:\n    0 : 0xBC7DA8B625E806FFEAE21C12A4B7BE9088DF23526D677C68CE79DDE2EAFD9650\n",
-    "pcr_bank": "sha256:0",
-    "created_at": 1784413638.4268894
-  },
   "iot-edge-02": {
     "device_id": "iot-edge-02",
-    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEMPMdDjIR3rla5pIO/dmswgGWLjCM\nxvDkAEnMzR0ziOn1s9Yge6/RRPoHleU/oy0R30g4CTq3Egz8eRVyDD0aAQ==\n-----END PUBLIC KEY-----\n",
-    "expected_pcr": "  sha256:\n    0 : 0xBC7DA8B625E806FFEAE21C12A4B7BE9088DF23526D677C68CE79DDE2EAFD9650\n",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZOwDEtf31CcGh96qyNdb4AuSJrAP\nAutw2BeJxUbN0x55kx2N8PK+zsvnP1ebn7vNA3Vn1+M2LYpGi7dZT/y0Rw==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0xEBE932E25AB71F3A1D9D483F4FAF79D8D07118F666F1F589827497E44DAC1754\n",
     "pcr_bank": "sha256:0",
-    "created_at": 1784413663.713974
+    "created_at": 1785341502.136311,
+    "ta_pub_b64": "BJrQYLngwuoX1SGov4JEYI2pdn1juMTNjIqo1D2smULdElWwEEj8SgbV3rYHehWysem6QS68lQ5O9+LgXrNMaIA="
+  },
+  "iot-edge-01": {
+    "device_id": "iot-edge-01",
+    "ak_pub_pem": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE0IIa7nhCd3PUgDiRICCI40ZLuJ6u\nf5c9eO+8sWVkoa5fZ8Pn1o2e4DxHW3/7yoUhMSxF3wUg/pFDFanFu5gGIw==\n-----END PUBLIC KEY-----\n",
+    "expected_pcr": "  sha256:\n    0 : 0xEBE932E25AB71F3A1D9D483F4FAF79D8D07118F666F1F589827497E44DAC1754\n",
+    "pcr_bank": "sha256:0",
+    "created_at": 1785341503.2327754,
+    "ta_pub_b64": "BKQS6bRzhpL1AqdDTMkdmL76nzvFB3EKrVtAOn4zGH73CPCehuSoXRGmSNZbKZVAgZ4nWQGZ+i+yACs/I2AgGMc="
   }
 }
