@@ -95,9 +95,9 @@ int edge_attest_to_server(void);
  * CMD_HANDSHAKE_COMPLETE with the cached server ECDH pubkey + nonce, plus the
  * cached server identity pubkey + signature. The TA first authenticates the
  * server (verifies the signature and, on first use, pins the identity key -
- * TOFU; docs/HANDOFF_serverAuthentication.md) and only then derives and stores
- * the AES-256 session key used by CMD_READ_AND_PROTECT. Returns non-zero (and
- * no session key is derived) if that server-identity check fails.
+ * TOFU) and only then derives and stores the AES-256 session key used by
+ * CMD_READ_AND_PROTECT. Returns non-zero (and no session key is derived) if
+ * that server-identity check fails.
  */
 int edge_handshake(void);
 

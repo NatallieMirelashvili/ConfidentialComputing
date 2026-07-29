@@ -90,7 +90,7 @@ transport. Each TCP connection is one self-contained session:
 ```
 device -> server   {"type": "hello", "device_id": "..."}
 server -> device   {"type": "attest_challenge", "nonce": ..., "server_ecdh_pub": ...}
-device -> server   {"type": "attest_response", "device_ecdh_pub": ..., "quote": ..., "signature": ...}
+device -> server   {"type": "attest_response", "device_ecdh_pub": ..., "quote": ..., "signature": ..., "ta_sig": ...}
 server -> device   {"type": "attest_result", "ok": true, ...}
 device -> server   {"type": "data", "seq": N, "nonce": "<b64>", "ciphertext": "<b64>"}
 server -> device   {"ok": true}   (per-message ack)
@@ -103,7 +103,12 @@ Key derivation (matches on both sides — `crypto.py` on the server,
    (`TA_CONFIDENTIAL_IOT_CMD_GENERATE_ATTESTATION_EVIDENCE`), sent as
    `device_ecdh_pub` in `attest_response`, alongside a transcript hash
    `SHA-256(nonce || server_ecdh_pub || device_ecdh_pub)` and the fTPM
-   quote/signature proving device integrity.
+   quote/signature proving device integrity. The same command also returns
+   `ta_sig` — a signature under a key generated inside the TA and sealed in
+   secure storage — which is what proves the ephemeral key came from the
+   genuine TA rather than from a root-compromised Normal World that bypassed
+   the TA and had the fTPM quote a key of its own (the AK belongs to the fTPM,
+   not the TA, and the quote is assembled by the untrusted Host).
 2. Once the server accepts the attestation, both sides compute the ECDH
    shared secret and run it through **HKDF-SHA256**, salted with the
    original challenge `nonce`, with a fixed info label

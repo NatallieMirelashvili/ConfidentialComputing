@@ -11,10 +11,9 @@
  * (see CMD_PROVISION_SENSOR_SECRET below). Invoked once per boot by the Host
  * CA, which passes no parameters and never sees the challenge or response -
  * the TA generates the challenge, relays it to the Sensor Module over the
- * sensor_link PTA's secure UART2 (Secure World only, see
- * docs/ARCHITECTURE.md), and verifies the reply itself via
- * TEE_MACCompareFinal(). READ_AND_PROTECT below refuses to run until this
- * has succeeded (sess->sensor_authenticated).
+ * sensor_link PTA's secure UART2 (Secure World only), and verifies the reply
+ * itself via TEE_MACCompareFinal(). READ_AND_PROTECT below refuses to run
+ * until this has succeeded (sess->sensor_authenticated).
  *
  * in:  none; out: none. Result reflects whether authentication succeeded
  *      (TEE_SUCCESS) or not (TEE_ERROR_MAC_INVALID / TEE_ERROR_COMMUNICATION
@@ -26,8 +25,8 @@
  * Read one sensor reading and protect (AES-256-GCM encrypt) it under the
  * session key derived by HANDSHAKE_COMPLETE, in a single call. Collapses the
  * old two-step PROCESS_SENSOR_DATA + PROTECT_SENSOR_DATA into the inverted
- * shape docs/ARCHITECTURE.md calls for: no plaintext input parameter exists
- * at all (the reading is pulled from the sensor_link PTA, entirely inside
+ * shape the architecture calls for: no plaintext input parameter exists at
+ * all (the reading is pulled from the sensor_link PTA, entirely inside
  * Secure World) - only ciphertext ever crosses back into the Host.
  *
  * A per-session, monotonically increasing sequence number is authenticated
@@ -69,9 +68,8 @@
  * identity key (see CMD 6), which is what proves the key came from the genuine
  * TA rather than from a root-compromised Normal World that bypassed the TA
  * entirely and had the fTPM quote a key of its own (real AK, real PCR0, and
- * until now nothing to tell the difference). See
- * docs/HANDOFF_taIdentityBinding.md - this is the third attestation leg:
- * AK proves the device, PCR0 proves the firmware, ta_sig proves the TA.
+ * until now nothing to tell the difference). This is the third attestation
+ * leg: AK proves the device, PCR0 proves the firmware, ta_sig proves the TA.
  *
  * in:  params[1].memref = nonce issued by the server (variable length, at most
  *      TA_CONFIDENTIAL_IOT_NONCE_MAX bytes)
@@ -100,8 +98,7 @@
  * attestation quote (attest_result.ok == true).
  *
  * Before deriving the session key, the TA now AUTHENTICATES THE SERVER
- * (Trust-On-First-Use pinning - see docs/HANDOFF_serverAuthentication.md).
- * It recomputes the labelled transcript digest
+ * (Trust-On-First-Use pinning). It recomputes the labelled transcript digest
  *   SHA-256(TA_CONFIDENTIAL_IOT_SERVER_IDENTITY_LABEL || nonce ||
  *           server_ecdh_pub || device_ecdh_pub)
  * and verifies the presented ECDSA-P256 signature (params[3]) over it:
@@ -157,11 +154,11 @@
  * generated INSIDE the TA and sealed in secure storage (TEE_STORAGE_PRIVATE,
  * object id "ciot.ta.identity"). The private half never leaves the TEE; only
  * the public half is ever exported, and that is what the management server
- * pins at registration alongside the AK. See docs/HANDOFF_taIdentityBinding.md.
+ * pins at registration alongside the AK.
  *
  * This is what makes the sealed key trustworthy only in combination with the
- * project-private TA signing key (keys/README.md): secure storage is scoped to
- * the TA UUID, so without a private signing key an attacker with root could
+ * project-private TA signing key (keys/ciot_ta.pem): secure storage is scoped
+ * to the TA UUID, so without a private signing key an attacker with root could
  * load a malicious TA carrying this same UUID and read the object.
  *
  * The device_id is sealed ALONGSIDE the keypair and is hashed into every
@@ -206,7 +203,7 @@
 #define TA_CONFIDENTIAL_IOT_SEQ_AAD_SIZE			8
 #define TA_CONFIDENTIAL_IOT_HKDF_INFO		"CC-IOT-1 device-aead"
 
-/* ---- TA identity (docs/HANDOFF_taIdentityBinding.md) ---------------------- */
+/* ---- TA identity --------------------------------------------------------- */
 
 /* TA-identity ECDSA-P256 signature: raw r||s, 32+32 bytes. The TEE emits
  * exactly this encoding, which is what the server's encode_dss_signature(r, s)

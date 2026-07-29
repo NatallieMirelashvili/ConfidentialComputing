@@ -67,7 +67,7 @@ static int provision_sensor_secret_mode(const char *b64)
  * message goes to stderr. Takes no argument - the device_id is read from
  * /etc/confidential_iot/device.conf (see load_config in edge_device.c), which
  * guarantees the identity the TA seals is byte-identical to the one the server
- * looks the key up by. See docs/HANDOFF_taIdentityBinding.md.
+ * looks the key up by.
  */
 static int provision_ta_identity_mode(void)
 {

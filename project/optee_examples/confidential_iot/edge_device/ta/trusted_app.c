@@ -80,9 +80,9 @@ void TA_CloseSessionEntryPoint(void *sess_ctx)
 /*
  * Lazily open (and cache for the TA session's lifetime) a session to the
  * sensor_link PTA - the sole path to the Sensor Module, over a UART only
- * Secure World can address (see docs/ARCHITECTURE.md). Opening it here
- * rather than in TA_OpenSessionEntryPoint means a device that never
- * authenticates a sensor never pays the cost.
+ * Secure World can address. Opening it here rather than in
+ * TA_OpenSessionEntryPoint means a device that never authenticates a sensor
+ * never pays the cost.
  */
 static TEE_Result open_sensor_pta(struct confidential_iot_session *sess)
 {
@@ -217,7 +217,7 @@ out_wipe_secret:
  * over public data only; it is computed here rather than in the Host so
  * that Normal World never needs its own SHA-256 implementation.
  */
-/* ---- TA identity (docs/HANDOFF_taIdentityBinding.md) --------------------- *
+/* ---- TA identity -------------------------------------------------------- *
  *
  * The TA owns an ECDSA P-256 keypair generated inside the TEE and sealed in
  * secure storage, together with the device_id it is bound to. Signing this
@@ -652,9 +652,9 @@ err_free_keypair:
  * is derived. Verifies the server's per-session identity signature over
  *   SHA-256(label || nonce || server_ecdh_pub || device_ecdh_pub)
  * and, on first use, pins the server's identity public key in secure storage.
- * See docs/HANDOFF_serverAuthentication.md and CMD_HANDSHAKE_COMPLETE's doc in
- * confidential_iot_ta.h. `device_pub` is this session's ephemeral public point
- * (0x04 || X || Y), reconstructed by the caller from sess->ecdh_keypair.
+ * See CMD_HANDSHAKE_COMPLETE's doc in confidential_iot_ta.h. `device_pub` is
+ * this session's ephemeral public point (0x04 || X || Y), reconstructed by the
+ * caller from sess->ecdh_keypair.
  *
  * Returns TEE_SUCCESS only if the server is authentic. On mismatch with the
  * pinned key returns TEE_ERROR_ACCESS_CONFLICT; on a bad signature returns

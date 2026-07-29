@@ -417,6 +417,82 @@ surgical delete a compromised Host could trigger to force a re-TOFU. Like the
 PCR0 stand-in (§2.9), the *automatic* reset is a QEMU/dev convenience: on real
 hardware, re-pinning would be an operator-controlled re-provision.
 
+### 2.11 Binding attestation to the genuine TA (server pins the TA, TOFU)
+
+§2.10 made the **server** prove itself to the **device**. This subsection is its
+mirror image: making the **TA** prove itself to the **server**. Full rationale in
+**`docs/HANDOFF_taIdentityBinding.md`**; the implementation walkthrough is in
+`docs/TA_IDENTITY_IMPLEMENTATION.md`.
+
+**The gap.** Everything in §2.1–2.9 proves the *device* (its AK) and the
+*firmware* (PCR0). None of it proves that the genuine `confidential_iot` TA ran
+the crypto, for two independent reasons:
+
+- The **AK belongs to the fTPM, not to the TA**, and it is persisted at
+  `0x8101000A` with no auth value and no policy — any Normal-World process that
+  can open `/dev/tpmrm0` can drive it.
+- The **quote is assembled by the untrusted Host** (`system("tpm2_quote …")` in
+  `attestation.c`); the TA never talks to the fTPM. Nothing forced the quoted
+  `device_ecdh_pub` to have come from the TA.
+
+So an attacker with root can **bypass the TA entirely**: generate its own ECDH
+keypair in Normal World, have the real fTPM quote it under the real PCR0,
+complete the handshake itself, and feed the server fabricated readings. All four
+of checks a–d pass. Tampering with the TA binary changes neither PCR0 (the app
+TA is not a boot image, so it is not measured) nor the AK.
+
+**The fix has two parts, and the first gates the second.**
+
+- **(A) Sign the TA with a project-private key.** The build previously used
+  OP-TEE's shipped default (`TA_SIGN_KEY ?= keys/default_ta.pem` →
+  `default.pem`), whose private half is committed upstream — so root could
+  re-sign a tampered TA and it would load. Now `scripts/build.sh` exports
+  `TA_SIGN_KEY=keys/ciot_ta.pem` (RSA-4096), which reaches all three consumers
+  that must agree on it: the core's baked-in `ta_pub_key.c` verifier, the
+  dev-kit key export, and every TA link step. `scripts/verify-ta-signing.sh`
+  asserts the core and the TA agree at the end of every build — a mismatch is
+  otherwise a silent build success where every TA fails to load at runtime.
+- **(B) Give the TA its own sealed identity key.** `CMD 6
+  GENERATE_TA_IDENTITY` generates an ECDSA P-256 keypair **inside** the TA
+  (`TEE_GenerateKey`) and seals it in `ciot.ta.identity`
+  (`TEE_STORAGE_PRIVATE`, first-write-wins) together with the `device_id` it is
+  bound to. Only the 65-byte public point is ever exported; `provision-device.sh`
+  puts it in the enrollment record as `ta_pub_b64`, and the server pins it
+  immutably alongside the AK. Every session, `CMD 3` signs
+  `SHA-256("CC-IOT-1 ta-identity" ‖ nonce ‖ server_ecdh_pub ‖ device_ecdh_pub ‖ device_id)`,
+  and the server verifies it before deriving anything (check (e)).
+
+**Why A gates B:** OP-TEE secure storage is scoped to the **TA UUID**. Without a
+private signing key, root could load a *malicious TA with the same UUID* and
+simply read the sealed identity key. Part A is what makes the sealed key in Part
+B trustworthy. Ship them together — a private signing key alone leaves the
+bypass open, and the identity key alone is readable.
+
+Three design points worth recording:
+
+- **Binding `device_ecdh_pub` is the crux.** A signature over the nonce alone
+  could be replayed alongside a substituted key. Including the session's
+  ephemeral public key is what forces it to be the TA's own. The nonce gives
+  freshness; `device_id` binds the signature to one enrolled device.
+- **Domain separation.** The label is distinct from `"CC-IOT-1 server-identity"`
+  and the pre-image is disjoint from the quote's qualifying data over the same
+  session, so the three signatures can never be confused. `"CC-IOT-1"` is the
+  protocol **version** prefix, not a per-device counter — per-device binding
+  comes from `device_id` inside the pre-image, placed **last** because it is the
+  only variable-length field, which keeps the encoding unambiguous without a
+  length prefix that the C and Python sides would both have to agree on.
+- **`device_id` is sealed, not passed per session.** The GP API caps a command
+  at four parameters and `CMD 3` already used all four, so `CMD 3` returns
+  `transcript_hash(32) ‖ ta_sig(64)` in one memref and takes the `device_id`
+  from secure storage. The security side effect is worth more than the
+  parameter it saved: the Host cannot assert a different identity per session,
+  and a copied `.device-state/*.img` cannot be presented under another
+  `device_id`. The cost is that renaming a device requires wiping its secure
+  storage, which surfaces as `TEE_ERROR_ACCESS_CONFLICT` at provisioning time.
+
+**End state — three independent legs, all enforced server-side:**
+**AK → correct device · PCR0 → genuine firmware · `ta_sig` → genuine TA.**
+
 ## 3. The protocol
 
 Newline-delimited JSON over the existing device-facing TCP port (matches
@@ -429,7 +505,8 @@ connection:
                        "server_identity_pub":"<b64>"}
 3. device → server   {"type":"attest_response","device_id":"...",
                        "device_ecdh_pub":"<b64>","quote":"<b64>",
-                       "signature":"<b64>","pcr_values":"<text>"}
+                       "signature":"<b64>","pcr_values":"<text>",
+                       "ta_sig":"<b64>"}
 4. server → device   {"type":"attest_result","ok":true,"session_ttl":3600,"server_sig":"<b64>"}
                       | {"ok":false,"error":"..."}
 5. device → server   {"type":"data","device_id":"...","seq":<int>,"nonce":"<b64>","ciphertext":"<b64>"}
@@ -438,20 +515,26 @@ connection:
 
 `seq` is a per-session, monotonically increasing message counter used for
 inner-session anti-replay — see §2.7. `server_identity_pub` / `server_sig`
-carry the server's TOFU-pinned identity proof — see §2.10.
+carry the server's TOFU-pinned identity proof — see §2.10. `ta_sig` carries the
+mirror-image proof in the other direction: the TA's own identity signature over
+this session — see §2.11.
 
 ### Device side, step 3 in detail
 
 1. Ask the TA (`TA_CONFIDENTIAL_IOT_CMD_GENERATE_ATTESTATION_EVIDENCE`) for
    a fresh ephemeral ECDH keypair, passing in the server's nonce and
-   `server_ecdh_pub`; get back the public half **and**
-   `transcript_hash = SHA-256(nonce ‖ server_ecdh_pub ‖ device_ecdh_pub)`,
-   computed inside the TA via the TEE Internal Core API (all inputs are
-   public, so returning the digest to Normal World is safe — see §2.5).
+   `server_ecdh_pub`; get back the public half **and** a 96-byte evidence
+   block holding
+   `transcript_hash = SHA-256(nonce ‖ server_ecdh_pub ‖ device_ecdh_pub)`
+   followed by `ta_sig` (§2.11), both computed inside the TA via the TEE
+   Internal Core API (all inputs are public, so returning them to Normal World
+   is safe — see §2.5).
 2. Run `tpm2_quote` against the fTPM (`/dev/tpmrm0`) with `transcript_hash`
    as the qualifying data, under the device's provisioned AK. Also
-   `tpm2_pcrread` for the raw PCR values.
-3. Send `device_ecdh_pub`, the quote, its signature, and the raw PCR text.
+   `tpm2_pcrread` for the raw PCR values. The quote covers the transcript hash
+   only — the first 32 bytes of the block — so this step is unchanged.
+3. Send `device_ecdh_pub`, the quote, its signature, the raw PCR text, and
+   `ta_sig`.
 
 ### Server verification, step 3→4 (see `attestation.py`)
 
@@ -471,8 +554,14 @@ c. **Recomputes the transcript hash** from its own issued nonce +
 d. **Compares** the verified PCR digest against the registry's
    `expected_pcr` baseline captured at enrollment time — this is the
    integrity check (was this the registered, untampered device).
+e. **Verifies `ta_sig`** against the registry's pinned `ta_pub_b64`, over
+   `"CC-IOT-1 ta-identity" ‖ nonce ‖ server_ecdh_pub ‖ device_ecdh_pub ‖ device_id`
+   — the "did the genuine **TA** do this?" check (§2.11). Checks a–d all pass
+   for a root-compromised Host that bypasses the TA entirely, because the AK
+   belongs to the fTPM and the quote is assembled in Normal World. This is the
+   one check the Host cannot influence.
 
-Only if all four pass does the server derive the session key:
+Only if all five pass does the server derive the session key:
 `HKDF-SHA256(ECDH(server_priv, device_ecdh_pub), salt=nonce, info=b"CC-IOT-1 device-aead")`
 — the same primitives `CC_Server`'s existing browser↔server AES-GCM channel
 already uses, just with a distinct HKDF info label so the two channels can
@@ -489,13 +578,13 @@ see §2.7) instead of plaintext, replacing the old
 
 | File | What changed |
 |---|---|
-| `edge_device/ta/include/confidential_iot_ta.h` | Added `TA_CONFIDENTIAL_IOT_CMD_HANDSHAKE_COMPLETE`; repointed `CMD_GENERATE_ATTESTATION_EVIDENCE`'s semantics to "handshake phase 1" — takes the server's nonce + ECDH pubkey as inputs, returns the device's ephemeral ECDH pubkey + the 32-byte transcript hash (not a self-signed report). Documented `CMD_AUTHENTICATE_SENSOR` and its gating role (§2.6), and `CMD_PROTECT_SENSOR_DATA`'s new `params[3].value.a` seq output; added `TA_CONFIDENTIAL_IOT_SEQ_AAD_SIZE` (§2.7). **Server-auth (§2.10):** extended `HANDSHAKE_COMPLETE`'s params[2]/[3] to carry `server_identity_pub` (65B) + `server_sig` (64B), added `TA_CONFIDENTIAL_IOT_SERVER_SIG_SIZE`, `..._SERVER_IDENTITY_LABEL`, `..._SERVER_PUBKEY_OBJID`, and documented the new failure codes. |
-| `edge_device/ta/trusted_app.c` / `.h` | Real logic: per-session state (`struct confidential_iot_session`), ECDH keypair generation, SHA-256 transcript-hash computation (`TEE_ALG_SHA256` digest — see §2.5), ECDH shared-secret derivation, HKDF-SHA256 session-key derivation, AES-256-GCM `ta_protect_sensor_data`. All via native TEE Internal API. Added the sensor-authentication gate (§2.6): a `sensor_authenticated` session flag, set by the `ta_authenticate_sensor` stub, enforced as a precondition in `ta_protect_sensor_data`/`ta_process_sensor_data`. Added the inner-session anti-replay counter (§2.7): a `send_seq` session field, authenticated as the GCM AAD in `ta_protect_sensor_data` and returned to the Host, reset to 0 on each fresh key in `ta_handshake_complete`. **Server-auth (§2.10):** new `authenticate_server()` — recomputes the labelled server-identity digest, opens/compares/pins the `ciot.server.pubkey` persistent object (TOFU), and does the first TA-side ECDSA verify (`TEE_ALG_ECDSA_P256` / `TEE_AsymmetricVerifyDigest`); called from `ta_handshake_complete` before ECDH+HKDF, gating `session_key_valid`. |
-| `edge_device/host/edge_device.c` / `.h` | Real `edge_attest_to_server()` (drives the whole hello→attest_result exchange, calls the TA + `attestation.c`), `edge_handshake()` (TA handshake-complete call), `edge_send_sensor_data_to_server()` (splits the TA's combined nonce+ciphertext output into the wire protocol's fields and attaches the `seq` the TA authenticated — §2.7), a persistent TEEC context/session (opened once, reused — required so the TA's per-session ECDH state survives between the two handshake calls), `edge_authenticate_sensor()` (triggers the per-boot sensor-auth check — §2.6), and local device config loading (`/etc/confidential_iot/device.conf` + `CIOT_*` env overrides). Base64 via mbedTLS (`mbedtls_base64_encode/decode`), JSON building/parsing via cJSON — see §2.5. **Server-auth (§2.10):** parses `server_identity_pub` from `attest_challenge` and `server_sig` from `attest_result`, caches both, and threads them into `edge_handshake()`'s params[2]/[3]. |
+| `edge_device/ta/include/confidential_iot_ta.h` | Added `TA_CONFIDENTIAL_IOT_CMD_HANDSHAKE_COMPLETE`; repointed `CMD_GENERATE_ATTESTATION_EVIDENCE`'s semantics to "handshake phase 1" — takes the server's nonce + ECDH pubkey as inputs, returns the device's ephemeral ECDH pubkey + the 32-byte transcript hash (not a self-signed report). Documented `CMD_AUTHENTICATE_SENSOR` and its gating role (§2.6), and `CMD_PROTECT_SENSOR_DATA`'s new `params[3].value.a` seq output; added `TA_CONFIDENTIAL_IOT_SEQ_AAD_SIZE` (§2.7). **Server-auth (§2.10):** extended `HANDSHAKE_COMPLETE`'s params[2]/[3] to carry `server_identity_pub` (65B) + `server_sig` (64B), added `TA_CONFIDENTIAL_IOT_SERVER_SIG_SIZE`, `..._SERVER_IDENTITY_LABEL`, `..._SERVER_PUBKEY_OBJID`, and documented the new failure codes. **TA-identity (§2.11):** added `CMD 6 GENERATE_TA_IDENTITY`, rewrote `CMD 3`'s documented output shape (`params[3]` is now the 96-byte `transcript_hash ‖ ta_sig` evidence block), and added `..._TA_SIG_SIZE`, `..._EVIDENCE_BLOCK_SIZE`, `..._TA_IDENTITY_LABEL`, `..._TA_IDENTITY_OBJID`, `..._DEVICE_ID_MAX`, `..._TA_IDENTITY_BLOB_SIZE`, `..._NONCE_MAX`. |
+| `edge_device/ta/trusted_app.c` / `.h` | Real logic: per-session state (`struct confidential_iot_session`), ECDH keypair generation, SHA-256 transcript-hash computation (`TEE_ALG_SHA256` digest — see §2.5), ECDH shared-secret derivation, HKDF-SHA256 session-key derivation, AES-256-GCM `ta_protect_sensor_data`. All via native TEE Internal API. Added the sensor-authentication gate (§2.6): a `sensor_authenticated` session flag, set by the `ta_authenticate_sensor` stub, enforced as a precondition in `ta_protect_sensor_data`/`ta_process_sensor_data`. Added the inner-session anti-replay counter (§2.7): a `send_seq` session field, authenticated as the GCM AAD in `ta_protect_sensor_data` and returned to the Host, reset to 0 on each fresh key in `ta_handshake_complete`. **Server-auth (§2.10):** new `authenticate_server()` — recomputes the labelled server-identity digest, opens/compares/pins the `ciot.server.pubkey` persistent object (TOFU), and does the first TA-side ECDSA verify (`TEE_ALG_ECDSA_P256` / `TEE_AsymmetricVerifyDigest`); called from `ta_handshake_complete` before ECDH+HKDF, gating `session_key_valid`. **TA-identity (§2.11):** new `ta_generate_ta_identity()` (CMD 6 — first `TEE_GenerateKey` on an ECDSA keypair, sealed to `ciot.ta.identity` with the bound `device_id`, first-write-wins) and `sign_ta_identity()` (first *signing* operation in this codebase — `TEE_MODE_SIGN` / `TEE_AsymmetricSignDigest`), called from `ta_generate_attestation_evidence`. That function now also copies `nonce`/`server_pub`/`device_pub` into TA-local buffers before hashing, because signing bytes that live in Host-shared memory would let a racing root Host swap the public point after the TA writes it. |
+| `edge_device/host/edge_device.c` / `.h` | Real `edge_attest_to_server()` (drives the whole hello→attest_result exchange, calls the TA + `attestation.c`), `edge_handshake()` (TA handshake-complete call), `edge_send_sensor_data_to_server()` (splits the TA's combined nonce+ciphertext output into the wire protocol's fields and attaches the `seq` the TA authenticated — §2.7), a persistent TEEC context/session (opened once, reused — required so the TA's per-session ECDH state survives between the two handshake calls), `edge_authenticate_sensor()` (triggers the per-boot sensor-auth check — §2.6), and local device config loading (`/etc/confidential_iot/device.conf` + `CIOT_*` env overrides). Base64 via mbedTLS (`mbedtls_base64_encode/decode`), JSON building/parsing via cJSON — see §2.5. **Server-auth (§2.10):** parses `server_identity_pub` from `attest_challenge` and `server_sig` from `attest_result`, caches both, and threads them into `edge_handshake()`'s params[2]/[3]. **TA-identity (§2.11):** `ta_handshake_init()` now receives the 96-byte evidence block and `edge_attest_to_server()` splits it — the first 32 bytes go to `create_attestation_report()` unchanged, the last 64 become `attest_response.ta_sig`. New `edge_provision_ta_identity()` (both halves of the `CONFIDENTIAL_IOT_NATIVE` split) drives CMD 6. |
 | `edge_device/host/net.c` / `.h` | New: a small TCP client matching `CC_Server`'s newline-JSON framing — a thin wrapper over POSIX sockets, the one local helper that isn't a library's job. (The original hand-rolled `sha256.c`/`base64.c`/`json_min.c` helpers that sat alongside it were removed in favor of the TA-computed hash + mbedTLS + cJSON, per §2.5.) |
 | `attestation/attestation.c` / `.h` | `create_attestation_report()`: shells out to `tpm2_quote`/`tpm2_pcrread`, base64-encodes the raw quote/signature (via mbedTLS) for JSON transport. `verify_attestation_report()` removed — verification is server-side only (device is Prover, not Verifier). |
 | `scripts/provision-device.sh` (new) | One-time `tpm2_createek`/`createak`/`evictcontrol`/`readpublic`/`pcrread`, writes the local device config, prints the enrollment record (JSON) for the admin to submit. Also runs `software_measure_pcr0()` on every invocation (guarded to extend at most once per boot): a Normal-World PCR0 software-measurement stand-in that `tpm2_pcrextend`s `sha256:0` with `SHA-256` of the `confidential_iot` TA + edge binary, so the quote baseline is non-zero and reboot-deterministic — see §2.9. |
-| `main.c` | Buffer size bump (base64 expansion needs more room than the original stub's placeholder size) + `edge_device_init()`/`edge_device_shutdown()` calls bracketing the existing flow, and an `edge_authenticate_sensor()` call right after init (once per boot, before any sensor data is handled — §2.6). |
+| `main.c` | Buffer size bump (base64 expansion needs more room than the original stub's placeholder size) + `edge_device_init()`/`edge_device_shutdown()` calls bracketing the existing flow, and an `edge_authenticate_sensor()` call right after init (once per boot, before any sensor data is handled — §2.6). **TA-identity (§2.11):** new `--provision-ta-identity` mode that prints the TA's identity public key as base64 on stdout **and nothing else**, so `provision-device.sh` can capture it with `$(...)`. |
 | `Makefile`, `CMakeLists.txt` | Added the new host source files and the `mbedcrypto`/`cjson` link dependencies; **removed** the dead `server/` C stub (superseded by `CC_Server`, confirmed out of scope). |
 | `project/buildroot/packages.conf` (new) | Tracked Buildroot config fragment enabling `BR2_PACKAGE_MBEDTLS` + `BR2_PACKAGE_CJSON` for the Normal-World rootfs (see §2.4 for how it survives workspace regeneration). |
 | `scripts/build.sh` | Exports the `BR2_*` lines from `packages.conf` into the OP-TEE `make` environment before every build. |
@@ -506,7 +595,9 @@ see §2.7) instead of plaintext, replacing the old
 |---|---|
 | `scripts/sync-project.sh` | Added an idempotent `sed` patch (same technique as the existing `optee_examples_ext.mk` dependency patch) that parameterizes `qemu_v8.mk`'s hardcoded gdbstub port (`-s` → `-gdb tcp::$(QEMU_GDB_PORT)`, default `1234`) so concurrent QEMU instances don't collide on it — see §2.8. Added two more idempotent `qemu_v8.mk` patches enabling firmware measured boot — TF-A `MEASURED_BOOT=1 EVENT_LOG_LEVEL=20 TPM_HASH_ALG=sha256 MBEDTLS_DIR=$(ROOT)/mbedtls`, and OP-TEE core `CFG_DT=y CFG_CORE_TPM_EVENT_LOG=y` — see §2.9. |
 | `scripts/run-project.sh` | Added `QEMU_INSTANCE` (derives per-instance NW/SW/GDB ports by a fixed offset and a default `device_id`), plus an auto-provisioning step (retries `provision-device.sh` until the fTPM settles) inserted into the existing tmux automation before the edge binary launches — see §2.8. **Server-auth (§2.10):** a host-side rebuild-detection block that diffs `.build-stamp` against a per-instance stored stamp and, on a genuine rebuild, wipes the device disk to a fresh device (new AK + fresh TOFU) and drops the stale registry entry via `reset-device-registry.sh`. |
-| `scripts/build.sh` | Exports `packages.conf`'s `BR2_*` lines into the OP-TEE `make` environment (§2.4). **Server-auth (§2.10):** writes a fresh `.build-stamp` after each successful build so `run-project.sh` can tell a rebuild from a relaunch. |
+| `scripts/build.sh` | Exports `packages.conf`'s `BR2_*` lines into the OP-TEE `make` environment (§2.4). **Server-auth (§2.10):** writes a fresh `.build-stamp` after each successful build so `run-project.sh` can tell a rebuild from a relaunch. **TA-identity (§2.11):** exports `TA_SIGN_KEY=keys/ciot_ta.pem` (one export reaches the core, the dev-kit export and every TA link step, since all three read it with `?=`) and runs `verify-ta-signing.sh` before writing the stamp. |
+| `scripts/verify-ta-signing.sh` (new) | **TA-identity (§2.11):** asserts the OP-TEE core's baked-in verifier key and the built `.ta`'s signature are the same project-private key — mechanically, by regenerating `ta_pub_key.c` and diffing it, then running `sign_encrypt.py verify`. A mismatch is otherwise a silent build success in which every TA fails to load at runtime. |
+| `keys/ciot_ta.pem` + `keys/README.md` (new) | **TA-identity (§2.11):** the project-private RSA-4096 TA signing key replacing OP-TEE's shipped default, whose private half is committed upstream. Never enters the firmware image or rootfs. |
 | `docker/Dockerfile` | Added `cmake` to the apt install list — TF-A v2.14's measured-boot event-log library (`libeventlog.a`) builds via cmake, which the base image lacked; without it the `MEASURED_BOOT=1` build fails at BL2 and no FIP is produced — see §2.9. |
 
 ### Server (`CC_Server`)
@@ -516,11 +607,12 @@ see §2.7) instead of plaintext, replacing the old
 | `server/constants.py` | Added `INFO_DEVICE_AEAD`, `DEVICE_SESSION_TTL_SECONDS`, `ATTEST_NONCE_LEN`, `ATTEST_CHALLENGE_TTL_SECONDS`, `DEVICE_ECDH_PUBKEY_LEN`, `DEVICE_LINK_ATTESTED_NETWORK`. |
 | `server/config.py` | Added `device_registry_path` (`MS_DEVICE_REGISTRY_PATH` env var). **Server-auth (§2.10):** added `server_identity_key_path` (in `certs_dir`, alongside the TLS key). |
 | `server/crypto.py` | **Server-auth (§2.10):** added `ensure_server_identity_key()` (load-or-generate the persisted P-256 identity key, never regenerate), `public_point_raw()`, and `sign_server_identity_raw()` (ECDSA-P256-SHA256, DER→raw 64-byte `r‖s`). |
-| `server/device_registry.py` (new) | Persistent `{device_id → ak_pub_pem, expected_pcr, pcr_bank}` JSON-file store; `register()`/`lookup()`/`list()`. |
-| `server/attestation.py` (new) | `AttestationVerifier`: challenge issuance/tracking, TPM2B_ATTEST/TPMT_SIGNATURE binary parsing (TPM 2.0 Part 2 structures), signature verification, transcript-hash recompute, PCR-digest recompute/compare, session-key derivation + storage. Tracks a per-session `last_seq` and exposes `check_and_advance_seq()` for inner-session anti-replay (§2.7). **Server-auth (§2.10):** loads the identity key once, advertises `server_identity_pub` in `issue_challenge`, and `verify_and_derive` now signs the labelled transcript and returns the raw `server_sig`. |
-| `server/device_link/attested_network.py` (new) | `AttestedNetworkDeviceLink(DeviceLink)`: the real hello/challenge/response/data state machine per TCP connection, replacing the old plaintext-trust behavior for this new link type. Each `data` message uses its `seq` (8-byte big-endian) as the AEAD AAD and is dropped if the seq is a replay/out-of-order (§2.7). **Server-auth (§2.10):** puts `server_identity_pub` on `attest_challenge` and `server_sig` on `attest_result`. |
+| `server/device_registry.py` (new) | Persistent `{device_id → ak_pub_pem, expected_pcr, pcr_bank}` JSON-file store; `register()`/`lookup()`/`list()`. **TA-identity (§2.11):** added the pinned `ta_pub_b64` field plus a tolerant `from_dict()` (a strict `DeviceRecord(**rec)` would make an older registry file crash the server at startup), moved every pinned-key comparison *ahead* of the idempotent early return (an `ak_pub`-only check would wave through a changed `ta_pub` as "already registered"), and added `validate_device_id()`. |
+| `server/attestation.py` (new) | `AttestationVerifier`: challenge issuance/tracking, TPM2B_ATTEST/TPMT_SIGNATURE binary parsing (TPM 2.0 Part 2 structures), signature verification, transcript-hash recompute, PCR-digest recompute/compare, session-key derivation + storage. Tracks a per-session `last_seq` and exposes `check_and_advance_seq()` for inner-session anti-replay (§2.7). **Server-auth (§2.10):** loads the identity key once, advertises `server_identity_pub` in `issue_challenge`, and `verify_and_derive` now signs the labelled transcript and returns the raw `server_sig`. **TA-identity (§2.11):** added `TA_IDENTITY_LABEL`, `build_ta_identity_preimage()`, `compute_ta_identity_msg()`, and check (e) in `verify_and_derive` — placed before key derivation so a failure leaves no session behind. Verification passes the **pre-image**, not the digest: `cryptography` hashes whatever it is given, so verifying the digest would hash twice and reject every honest device. |
+| `server/device_link/attested_network.py` (new) | `AttestedNetworkDeviceLink(DeviceLink)`: the real hello/challenge/response/data state machine per TCP connection, replacing the old plaintext-trust behavior for this new link type. Each `data` message uses its `seq` (8-byte big-endian) as the AEAD AAD and is dropped if the seq is a replay/out-of-order (§2.7). **Server-auth (§2.10):** puts `server_identity_pub` on `attest_challenge` and `server_sig` on `attest_result`. **TA-identity (§2.11):** passes `msg["ta_sig"]` through to the verifier — subscripted, not `.get()`, so a Host that skips the TA and omits the field hits the existing `KeyError` handler and fails closed with no new code path. |
 | `server/device_link/__init__.py` | Wired in `attested_network` as a new `MS_DEVICE_LINK=attested_network` option (kept alongside the existing `stub`/`network` for backward compatibility with existing demos). |
-| `server/app_server.py` | New `POST /api/devices/register` endpoint — gated behind the existing authenticated User↔Server channel. |
+| `server/app_server.py` | New `POST /api/devices/register` endpoint — gated behind the existing authenticated User↔Server channel. **TA-identity (§2.11):** requires `ta_pub_b64`, validates it is a real on-curve P-256 point, and re-encodes its base64 canonically so cosmetic encoding differences cannot masquerade as a key change (a spurious 409 would look exactly like an attack). |
+| `server/tests/test_register_endpoint.py` (new) | **TA-identity (§2.11):** first tests for `POST /api/devices/register` — valid/missing/short/off-curve/compressed `ta_pub_b64`, the 409 on a changed TA key, base64 canonicalisation, and `device_id` validation. |
 | `server/tests/test_attestation.py` (new) | 9 tests covering the full protocol with real ECDSA/ECDH/HKDF/AES-GCM cryptography, including inner-session replay rejection (§2.7) and, for server-auth (§2.10), that `attest_result`'s raw-64 `server_sig` verifies against the advertised `server_identity_pub` over the labelled transcript and fails under a wrong key/transcript — see Testing guide. |
 
 Scope note on the Secure-Element↔Sensor challenge-response (steps 6-7 of the
@@ -582,3 +674,34 @@ Next required step (must be done):
 Everything else — the TA's cryptographic logic, the Host CA's protocol
 orchestration, and the entire server side — is verified as described in
 `docs/ATTESTATION_TESTING.md`.
+
+> **Status note (later missions).** Two items above have since been superseded
+> and are kept only as a record of the path taken. The Normal-World
+> `software_measure_pcr0()` stand-in was **removed** in favour of a real,
+> firmware-rooted measured-boot chain under the FF-A / S-EL1 SPMC topology
+> (`DESIGN.md` §8), and the Attestation Key **is** now persisted across reboots
+> (`docs/PERSISTENT_AK_IMPLEMENTATION.md`). Read §2.9 as history, not as the
+> current design.
+
+### TA-identity binding (§2.11) — status
+
+Implemented and verified end to end. Beyond the live QEMU run:
+
+- **63 server-side tests pass** (`cd CC_Server && python -m pytest server/tests -q`),
+  including the bypass regression itself: a fully valid quote — real AK
+  signature, real PCR0, correct transcript — with a `ta_sig` from the wrong key
+  is rejected, and no session key is stored.
+- Those bypass tests were **mutation-tested**: neutering check (e) makes all
+  four of them fail, so they are load-bearing rather than incidentally passing.
+- The **C/Python byte-parity risk is retired by construction.** A standalone C
+  program replicating the TA's exact `TEE_DigestUpdate` sequence and sealed-blob
+  offsets reproduces the known-answer digest asserted in
+  `test_ta_identity_preimage_is_byte_exact`
+  (`b34347ce…`). If anyone changes the pre-image on either side, that test
+  fails and names the reason.
+
+Two residual caveats, both stated in `DESIGN.md` §18: the TA signing key is
+committed to the repo (private relative to the world, not to repo-holders), and
+the TA-identity guarantee inherits the trust-on-first-use bound that already
+applies to the AK — it prevents silent takeover of an established identity, not
+enrollment by a device that was never genuine.

@@ -1,6 +1,20 @@
 # Handoff: Binding Attestation to the Genuine TA (private TA signing key + TA-identity key)
 
-Status: **NOT IMPLEMENTED — this is the spec for the next instance.** It closes
+> **STATUS: IMPLEMENTED AND VERIFIED (2026-07-27).** This document is kept as the
+> original spec and rationale; it is no longer a to-do list. Read
+> **`docs/TA_IDENTITY_IMPLEMENTATION.md`** for what was actually built, and
+> `docs/ATTESTATION_DESIGN.md` §2.11 for the design summary.
+>
+> **Three details below turned out to be wrong** and are corrected in the
+> implementation doc §6 — do not copy them: §4e's verification sketch
+> double-hashes (it would reject every honest device); §4d's "extra output
+> param" does not exist (CMD 3 already used all four GP slots); and the spec
+> misses a race where the TA signs bytes still living in Host-shared memory,
+> which reopens Gap 2 through its own fix. §9's checklist items are all settled:
+> the signing key lives in `keys/` (committed), and this OP-TEE build does
+> support ECDSA keygen + sign in a TA with raw `r‖s` in the expected order.
+
+Status (original): **NOT IMPLEMENTED — this is the spec for the next instance.** It closes
 two gaps found by a code scan on 2026-07-25 (device side, server side, and the
 OP-TEE TA-signing/load path were all read directly — see §1 for the grounding).
 Do **not** edit `docs/DESIGN.md` for this yet; that was explicitly deferred by

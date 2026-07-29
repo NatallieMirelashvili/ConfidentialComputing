@@ -46,8 +46,7 @@ static uint8_t g_server_ecdh_pub[CIOT_ECDH_PUB_SIZE];
 /* Server-identity material for the device->server authentication (TOFU): the
  * server's identity public key (from attest_challenge) and its per-session
  * signature (from attest_result). Cached here across edge_attest_to_server()
- * and edge_handshake(), which passes both to the TA to verify + pin. See
- * docs/HANDOFF_serverAuthentication.md. */
+ * and edge_handshake(), which passes both to the TA to verify + pin. */
 static uint8_t g_server_identity_pub[CIOT_ECDH_PUB_SIZE];
 static uint8_t g_server_sig[CIOT_SERVER_SIG_SIZE];
 static int g_attested;
@@ -703,7 +702,7 @@ int edge_handshake(void)
 		memset(&op, 0, sizeof(op));
 		/* params[2]/[3] carry the server-identity pubkey + signature so
 		 * the TA can authenticate the server (verify + TOFU-pin) before
-		 * it derives the session key - see docs/HANDOFF_serverAuthentication.md. */
+		 * it derives the session key. */
 		op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
 						  TEEC_MEMREF_TEMP_INPUT,
 						  TEEC_MEMREF_TEMP_INPUT,

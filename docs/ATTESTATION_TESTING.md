@@ -15,8 +15,10 @@ python3 -m pip install --user pytest fastapi httpx uvicorn websockets cryptograp
 python3 -m pytest server/tests -v
 ```
 
-Expect **16 passed**: the 9 pre-existing tests plus 6 new ones in
-`server/tests/test_attestation.py`:
+Expect **63 passed, 2 skipped** (the 2 are `test_poc.py`, which self-skips
+unless a real QEMU device attests within 15 s).
+
+Core attestation coverage (`server/tests/test_attestation.py`):
 
 | Test | What it proves |
 |---|---|
@@ -27,10 +29,39 @@ Expect **16 passed**: the 9 pre-existing tests plus 6 new ones in
 | `test_attestation_rejects_replayed_response` | The same response can't be replayed against a stale/already-consumed challenge. |
 | `test_attested_network_link_full_protocol` | Drives `AttestedNetworkDeviceLink`'s actual per-connection state machine (hello → attest_challenge → attest_response → attest_result → data) end to end. |
 
+TA-identity binding (`docs/TA_IDENTITY_IMPLEMENTATION.md`). The first one is
+**the** test for the whole feature — everything else exists to keep it honest:
+
+| Test | What it proves |
+|---|---|
+| `test_ta_identity_bypass_with_wrong_key_is_rejected` | The compromised-Host bypass: a **fully valid** quote — real AK signature, real PCR0, correct transcript — is still rejected when `ta_sig` comes from anything but the sealed TA key. No session key is stored. |
+| `test_ta_identity_bypass_with_missing_ta_sig_is_rejected` | The same bypass by omission, plus a control run proving `ta_sig` is the *only* difference between accept and reject. |
+| `test_ta_sig_over_a_different_device_pub_is_rejected` | A genuine TA signature replayed alongside a substituted ECDH key is rejected — this is why `device_ecdh_pub` is in the pre-image. |
+| `test_ta_sig_over_a_different_device_id_is_rejected` | The per-device binding, in executable form. |
+| `test_ta_sig_from_an_earlier_session_is_rejected` | Freshness, independent of the quote's own transcript check. |
+| `test_ta_identity_preimage_is_byte_exact` | Known-answer test for the exact bytes the TA hashes — the C/Python parity lock (see below). |
+| `test_ta_sig_must_be_verified_over_the_preimage_not_the_digest` | Guards the double-hash trap: verifying the digest instead of the pre-image would reject every honest device. |
+| `test_ta_identity_is_domain_separated_from_the_other_signatures` | The TA pre-image can never collide with the quote's qualifying data or the server-identity pre-image. |
+| `test_attested_network_rejects_attest_response_without_ta_sig` | The bypass driven through the real connection state machine, not just the verifier. |
+| `test_verify_rejects_record_with_empty_ta_pub` | A device enrolled before this feature loads, but cannot attest. |
+
+Registry and endpoint coverage lives in `test_device_registry.py` (pinned-key
+immutability, including the case where the AK matches but the TA key changed)
+and `test_register_endpoint.py` (point validation, base64 canonicalisation, 409
+on a changed TA key, `device_id` validation).
+
 These tests build syntactically-correct TPM2B_ATTEST/TPMT_SIGNATURE bytes
 in pure Python (real ECDSA signing via `cryptography`, no real TPM
 involved) — they validate the server's parsing/verification logic
 independent of whatever the real `tpm2_quote` CLI syntax turns out to need.
+
+**Two things worth knowing about these tests as a suite.** The bypass tests were
+*mutation-tested* — neutering check (e) in `attestation.py` makes all four fail,
+so they are load-bearing rather than incidentally passing; re-do that if you ever
+refactor the check. And `test_ta_identity_preimage_is_byte_exact` pins a
+known-answer digest computed from the wire spec alone, so a TA developer can
+compute the same value in C and compare directly instead of bisecting a
+byte-parity bug across the C/Python boundary.
 
 If you change `server/attestation.py`, `device_registry.py`, or
 `device_link/attested_network.py`, re-run this before anything else.
@@ -90,6 +121,18 @@ scripts/build-project.sh          # rebuilds project sources + OP-TEE/QEMU image
 edits under `project/optee_examples/confidential_iot/` are picked up
 automatically — you never need to touch `.optee-workspace` by hand.
 
+**The build ends with `scripts/verify-ta-signing.sh`**, which asserts the OP-TEE
+core's baked-in verifier key and the built `.ta`'s signature are the same
+project-private key (`keys/ciot_ta.pem`). Don't skip past its output: a mismatch
+is otherwise a *silent* build success in which every TA then fails to load at
+runtime, which looks like anything but a key problem. You can run it standalone
+after a build.
+
+To check Part A's actual guarantee (a tampered TA won't load), flip a byte in
+`/lib/optee_armtz/7d9f6d20-5f11-4d0c-9a17-61c9c91c0001.ta` inside the guest —
+OP-TEE core must refuse to load it (`shdr_verify_signature` failure on the
+secure console). A clean rebuild loads normally.
+
 Then boot it:
 
 ```bash
@@ -98,6 +141,13 @@ scripts/run-project.sh
 
 This opens a tmux session, continues QEMU, logs in as `root` in the Normal
 World console, and runs `optee_example_confidential_iot_edge` automatically.
+
+> **If you are updating an existing checkout**, the TA signing key change moves
+> PCR0, so every enrolled device's baseline is stale *and* no existing registry
+> record has a `ta_pub_b64`. Both symptoms look like a device that just won't
+> attest. Follow the runbook in `docs/RESET_DEVICE_REGISTRY.md` — the short
+> version is build → `scripts/reset-device-registry.sh --all` → **restart
+> CC_Server** → `run-project.sh`, in that order.
 
 
 ## 4. Running several devices concurrently 
@@ -198,6 +248,34 @@ on first real-hardware run, in order of likelihood:
    resets the sensor connection). Fixing it in-place would mean draining/
    resyncing the UART in the Secure-World `sensor_link` PTA — deliberately not
    done, since one-run-per-boot is the intended flow.
+
+7. **`bad enrollment record: 'ta_pub_b64'`** at registration, on both the
+   device console and the `register-device.sh` output — the guest image
+   predates TA-identity binding. Confirm with
+   `grep -c ta_pub_b64 .optee-workspace/out-br/target/usr/bin/provision-device.sh`
+   (0 means stale). Rebuild; the new `provision-device.sh` and edge binary land
+   in the rootfs. Then follow the reset runbook, because the same rebuild also
+   moves PCR0.
+8. **`device has no enrolled TA identity key`** in the server log — the
+   *registry* is stale rather than the image. The server also warns about this
+   per device at startup. Re-registering will **not** fix it (409 by design, to
+   avoid reopening the trust-on-first-use window); drop the record with
+   `scripts/reset-device-registry.sh <device_id>` and restart the server.
+9. **`TA panicked`** on the secure console during the first attestation after a
+   fresh provision — most likely the sealed TA identity object is corrupt.
+   `TEE_AsymmetricSignDigest` panics rather than returning an error on anything
+   except `SHORT_BUFFER`, so this is what a bad key looks like. Wipe the
+   device's disk (`.device-state/<device_id>.img`) and re-provision. If it
+   persists, raise `TA_STACK_SIZE` in `user_ta_header_defines.h` before
+   suspecting the crypto — a stack overflow presents identically.
+10. **TA-identity verification fails for every device**, with valid quotes —
+    suspect a pre-image mismatch between the TA and the server, not the ECDSA
+    itself. Don't bisect it by hand: `test_ta_identity_preimage_is_byte_exact`
+    pins a known-answer digest derived from the wire spec, so compute the same
+    digest in C over the same fixed inputs and compare. (`xtest 4006`/`4011`
+    independently exercise this build's ECDSA keygen/sign/verify — but note the
+    optee_test TAs may need a one-time rebuild to load after the signing-key
+    change; see `docs/TA_IDENTITY_IMPLEMENTATION.md` §7.)
 
 For all of the above, the Python test suite (§1) staying green tells you
 the *server-side logic* is fine — so a real-hardware failure almost always

@@ -16,9 +16,8 @@
 # POST /api/devices/register (see CC_Server/server/app_server.py) - no human
 # step required. Idempotent: gated on whether the AK already exists at
 # AK_HANDLE in the fTPM (not on /etc/confidential_iot, which lives on the
-# ephemeral initrd) - so on a build with the persistent /var/lib/tee disk
-# (see docs/HANDOFF_persistentAK.md), a reboot just reprints the existing
-# record instead of minting a new AK.
+# ephemeral initrd) - so on a build with the persistent /var/lib/tee disk, a
+# reboot just reprints the existing record instead of minting a new AK.
 #
 # NOTE: exact tpm2-tools flags below should be checked against
 # `tpm2_createek --help` / `tpm2_createak --help` / `tpm2_readpublic --help`
@@ -41,8 +40,8 @@ SERVER_PORT="${3:-9000}"
 # NOTE: PCR sha256:0 is now populated by REAL, firmware-rooted measured boot -
 # TF-A measures every boot image (BL31/BL32=OP-TEE/BL33) into the TCG event log,
 # hands it to OP-TEE (running as the S-EL1 SPMC) via TOS_FW_CONFIG, and the fTPM
-# replays it into the PCRs before Linux userspace ever runs. See docs/DESIGN.md
-# and the FF-A topology switch + tfa-tos-fw-config-eventlog.patch wired up in
+# replays it into the PCRs before Linux userspace ever runs. See the FF-A
+# topology switch + tfa-tos-fw-config-eventlog.patch wired up in
 # scripts/sync-project.sh. The old Normal-World software_measure_pcr0() stand-in
 # (which hashed the .ta/edge binaries from userspace) has been removed: it was
 # not hardware-rooted - a compromised OS could extend the good hashes while
@@ -64,7 +63,6 @@ print_enrollment_record() {
 	# with a key that was generated inside the TA and never leaves it is what
 	# closes that. Minted and sealed (bound to $DEVICE_ID) on the first call,
 	# re-exported unchanged afterwards, so this is safe on every boot.
-	# See docs/HANDOFF_taIdentityBinding.md.
 	#
 	# Reads device.conf for its device_id, so it must run AFTER that file is
 	# written - it is, print_enrollment_record is called last.

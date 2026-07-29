@@ -16,12 +16,11 @@
  *
  * sensor_authenticated records whether the attached Sensor Module has proven
  * its identity to this device via a real HMAC-SHA256 challenge-response
- * (ta_authenticate_sensor, run over the sensor_link PTA's secure UART2 -
- * see docs/ARCHITECTURE.md). It is a precondition, enforced inside the TA,
- * for ta_read_and_protect. Keeping the verdict here (rather than trusting
- * the Host to have run the check) is what stops a tampered Host CA from
- * simply skipping sensor authentication: the data-handling command refuses
- * to run while this is false.
+ * (ta_authenticate_sensor, run over the sensor_link PTA's secure UART2). It is
+ * a precondition, enforced inside the TA, for ta_read_and_protect. Keeping the
+ * verdict here (rather than trusting the Host to have run the check) is what
+ * stops a tampered Host CA from simply skipping sensor authentication: the
+ * data-handling command refuses to run while this is false.
  *
  * send_seq is a per-session monotonically increasing message counter used for
  * inner-session anti-replay: ta_read_and_protect increments it for every

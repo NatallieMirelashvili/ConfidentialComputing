@@ -40,6 +40,7 @@ The core idea: **a device must cryptographically prove it is running untampered 
 The trust is **mutual and layered**:
 
 - The **server** verifies the **device** (via the TPM quote) — the device cannot lie about what firmware it runs.
+- The **server** verifies the **Trusted Application** (via a signature from a key sealed inside the TEE) — a compromised host cannot bypass the TA and do the crypto itself.
 - The **device** verifies the **server** (via a pinned server-identity signature, TOFU-style) — a compromised host process cannot redirect the device to an impostor server.
 - The **Trusted Application** verifies the **sensor** (via an HMAC challenge-response) — and the untrusted Host never sees sensor plaintext.
 
@@ -272,7 +273,7 @@ flowchart LR
 
 1. `main.c:main` → `edge_device_init` opens a persistent TEEC session to the TA.
 2. `edge_authenticate_sensor` → TA cmd 0 `ta_authenticate_sensor` → `open_sensor_pta` → PTA `CMD_CHALLENGE` → over UART2 to `sensor_daemon.handle_challenge` → TA verifies HMAC with `TEE_MACCompareFinal`, sets `sensor_authenticated`.
-3. `edge_ensure_session` → `edge_attest_to_server` opens TCP `:9100`, exchanges `hello`/`attest_challenge`, calls TA cmd 3 `ta_generate_attestation_evidence` (ephemeral ECDH + transcript hash), then `create_attestation_report` (`tpm2_quote`), sends `attest_response`.
+3. `edge_ensure_session` → `edge_attest_to_server` opens TCP `:9100`, exchanges `hello`/`attest_challenge`, calls TA cmd 3 `ta_generate_attestation_evidence` (ephemeral ECDH + transcript hash + TA-identity signature), then `create_attestation_report` (`tpm2_quote`, over the transcript hash only), sends `attest_response`.
 4. `edge_handshake` → TA cmd 4 `ta_handshake_complete` → `authenticate_server` (TOFU) → ECDH + HKDF → session key.
 5. Loop: `edge_call_ta` → TA cmd 1 `ta_read_and_protect` → PTA `CMD_READ` → sensor reading → AES-256-GCM seal → `edge_send_sensor_data_to_server` pushes a `data` message.
 
@@ -289,6 +290,8 @@ Every key/secret in the system, where it lives, and what it protects:
 | **Server identity key** | ECDSA P-256 (PKCS8) | `server/certs/server_identity_key.pem` | Persistent; **never regenerated** | Signs the per-session `server_sig` proving server identity to the device (TOFU-pinned by the device). |
 | **Server TLS key + cert** | RSA 2048, self-signed X.509 | `server/certs/server_key.pem` + `server_cert.pem` | Persistent (regenerated if missing) | The TLS 1.3 browser/admin channel (`:8100`). Separate from the identity key. |
 | **Pinned server pubkey (device side)** | 65-byte SEC1 P-256 point | TA secure storage, object `ciot.server.pubkey` | Persistent, first-write-wins | The device's TOFU anchor for the server's identity. |
+| **TA identity key** | ECDSA P-256 | TA secure storage, object `ciot.ta.identity` — **generated inside the TA; the private half never leaves the TEE** | Persistent, first-write-wins (sealed together with the `device_id` it is bound to) | Signs the per-session `ta_sig` proving the genuine TA produced this session's ECDH key. Public half pinned in the server registry (`ta_pub_b64`). |
+| **TA signing key (build-time)** | RSA 4096 | `keys/ciot_ta.pem` in the repo — **never on the device** | Persistent (committed) | Signs the `.ta` binaries; its public half is baked into OP-TEE core as the load-time verifier. See [`keys/README.md`](../keys/README.md). |
 | **Sensor PSK** | 32-byte pre-shared secret | TA secure storage, object `ciot.sensor.psk`; sensor side in a `--secret` file | Persistent (idempotent write) | HMAC-SHA256 sensor authentication. |
 | **Device ephemeral ECDH keypair** | ECDH P-256 | TA session RAM only | Single-use per attestation | Derives the session key. Freed after the handshake. |
 | **Session key** | AES-256 (32 bytes) | TA session RAM + server `DeviceSession` | Per session (TTL 3600 s) | AES-256-GCM sealing of every `data` message. **Never leaves the TA on the device side.** |
@@ -297,6 +300,7 @@ Two design notes worth highlighting:
 
 - **The AK is not the device's transport identity by chance — it is by design.** The AK lives in the fTPM and is `restricted` (can sign only TPM structures). It cannot be coerced into signing attacker-chosen data, so the quote is a trustworthy statement about firmware, nothing else.
 - **The server has two distinct keys on purpose.** The RSA TLS cert secures the browser channel; the P-256 *identity* key authenticates the server to devices with a lightweight 64-byte raw signature the TA can verify without ASN.1 parsing.
+- **The two TA-related keys do different jobs and must not be confused.** The *build-time* RSA signing key decides **which TA binary may load at all** (checked by OP-TEE core at load time). The *runtime* P-256 identity key proves **that the loaded TA is the one doing this session's crypto** (checked by the server per session). The first gates the second: OP-TEE secure storage is scoped to the TA UUID, so without a private signing key an attacker could load a malicious TA carrying the same UUID and simply read the sealed identity key. Neither is sufficient alone.
 
 ---
 
@@ -332,7 +336,8 @@ The topology switch and the TF-A patch are applied by `scripts/sync-project.sh` 
 
 - **Measured into PCR0:** the firmware / secure-world TCB — the TF-A stages and **OP-TEE core (BL32)**, plus BL33. Any change to these → different PCR0 → attestation rejected.
 - **Not measured:** the Linux kernel + rootfs (the chain isn't extended into U-Boot/Linux), and the **Normal-World Host binary** (`optee_example_confidential_iot_edge`). The Host is *untrusted by design* — all security gates live in the TA — so this is consistent with the threat model ([§17](#17-threat-model--security-guarantees)).
-- **TA integrity is covered transitively, not by PCR0 directly:** OP-TEE core verifies every TA's signature before loading it (see [§14](#14-what-code-is-signed--how-integrity-is-guaranteed)); because OP-TEE core is itself measured, that guarantee is rooted in PCR0.
+- **TA integrity is covered transitively, not by PCR0 directly:** OP-TEE core verifies every TA's signature before loading it, against a **project-private** RSA key (`keys/ciot_ta.pem`) whose public half is compiled into the core (see [§14](#14-what-code-is-signed--how-integrity-is-guaranteed)); because OP-TEE core is itself measured, that guarantee is rooted in PCR0.
+- **Which TA ran is proved separately, by the TA itself:** PCR0 says nothing about *which* TA did a given session's crypto — the AK belongs to the fTPM and the quote is assembled by the untrusted Host. That is closed by the TA-identity signature ([§9](#9-the-attestation-protocol) check (e)), not by measurement.
 
 Because the fTPM replays the log at boot (and PCRs zero on power-on), PCR0 is populated automatically every boot — deterministic across reboots of the same image, different if any measured firmware image changes. `provision-device.sh` simply reads it (`tpm2_pcrread sha256:0`) as the enrollment baseline.
 
@@ -355,7 +360,8 @@ Because the fTPM replays the log at boot (and PCRs zero on power-on), PCR0 is po
 2. server → device   {"type":"attest_challenge","nonce":"<b64>",
                        "server_ecdh_pub":"<b64>","server_identity_pub":"<b64>"}
 3. device → server   {"type":"attest_response","device_id":"...","device_ecdh_pub":"<b64>",
-                       "quote":"<b64>","signature":"<b64>","pcr_values":"<text>"}
+                       "quote":"<b64>","signature":"<b64>","pcr_values":"<text>",
+                       "ta_sig":"<b64>"}
 4. server → device   {"type":"attest_result","ok":true,"session_ttl":3600,"server_sig":"<b64>"}
                     | {"type":"attest_result","ok":false,"error":"..."}
 5. device → server   {"type":"data","device_id":"...","seq":<int>,"nonce":"<b64>","ciphertext":"<b64>"}
@@ -372,6 +378,7 @@ Field reference:
 | `quote` | `TPM2B_ATTEST` (b64) | The signed `TPMS_ATTEST` body, length-prefixed. |
 | `signature` | `TPMT_SIGNATURE` (b64) | ECDSA `(r, s)` over the quote body. |
 | `pcr_values` | text | Raw `tpm2_pcrread sha256:0` output, so the server recomputes the digest independently. |
+| `ta_sig` | 64 bytes raw `r‖s` (b64) | TA-identity ECDSA proof over `"CC-IOT-1 ta-identity" ‖ nonce ‖ server_ecdh_pub ‖ device_ecdh_pub ‖ device_id`. Produced inside the TA; proves the genuine TA generated `device_ecdh_pub`. |
 | `server_sig` | 64 bytes raw `r‖s` (b64) | Server-identity ECDSA proof (see [§10](#10-server-authentication-mutual-trust--tofu)). |
 | `seq` | uint32 | Monotonic per-session counter; authenticated as GCM AAD. |
 
@@ -392,13 +399,13 @@ sequenceDiagram
     SRV->>HOST: 2. attest_challenge {nonce, server_ecdh_pub, server_identity_pub}
 
     HOST->>TA: cmd 3 GENERATE_ATTESTATION_EVIDENCE (nonce, server_ecdh_pub)
-    TA->>TA: gen ephemeral ECDH keypair,<br/>transcript = SHA256(nonce‖srv_pub‖dev_pub)
-    TA-->>HOST: device_ecdh_pub, transcript_hash
+    TA->>TA: gen ephemeral ECDH keypair,<br/>transcript = SHA256(nonce‖srv_pub‖dev_pub),<br/>ta_sig = sign(sealed TA identity key)
+    TA-->>HOST: device_ecdh_pub, transcript_hash ‖ ta_sig
     HOST->>FTPM: tpm2_quote -l sha256:0 -q transcript_hash (AK @0x8101000A)
     FTPM-->>HOST: TPMS_ATTEST + signature
-    HOST->>SRV: 3. attest_response {device_ecdh_pub, quote, signature, pcr_values}
+    HOST->>SRV: 3. attest_response {device_ecdh_pub, quote, signature, pcr_values, ta_sig}
 
-    Note over SRV: (a) PCR digest binds to signed quote<br/>(b) ECDSA-P256-SHA256 verify w/ pinned AK<br/>(c) transcript == quote extraData<br/>(d) PCR digest == expected_pcr baseline
+    Note over SRV: (a) PCR digest binds to signed quote<br/>(b) ECDSA-P256-SHA256 verify w/ pinned AK<br/>(c) transcript == quote extraData<br/>(d) PCR digest == expected_pcr baseline<br/>(e) ta_sig verifies under pinned ta_pub
     SRV->>SRV: HKDF(ECDH(srv_priv, dev_pub), salt=nonce, info="CC-IOT-1 device-aead") → AES-256 key
     SRV->>SRV: sign server_sig over transcript
     SRV->>HOST: 4. attest_result {ok:true, session_ttl:3600, server_sig}
@@ -418,16 +425,19 @@ sequenceDiagram
     end
 ```
 
-### The four server-side verification checks
+### The five server-side verification checks
 
-All four must pass (`attestation.py:143-223`, `verify_and_derive`):
+All five must pass (`attestation.py`, `verify_and_derive`):
 
 - **(a) PCR-digest binding** — recompute the digest from the reported `pcr_values` text and require it to equal the `pcrDigest` embedded *inside* the signed quote. The device cannot report PCR values out-of-band from what it signed.
 - **(b) Signature verification** — verify `signature` over the exact marshaled `TPMS_ATTEST` body using the device's **pinned AK** — **ECDSA / P-256 / SHA-256**. (`(r,s)` are DER-wrapped for the `cryptography` library.)
 - **(c) Transcript / freshness** — recompute `SHA-256(nonce ‖ server_ecdh_pub ‖ device_ecdh_pub)` from the server's own nonce + keys and require it to equal the quote's `extraData` (qualifying data). Binds the quote to this live session; blocks replay.
 - **(d) Integrity baseline** — require the verified PCR digest to equal the registry's `expected_pcr` captured at enrollment. This is the "is it running known-good firmware?" check.
+- **(e) TA identity** — verify `ta_sig` against the registry's pinned `ta_pub_b64`. This is the "did the genuine **TA** do this?" check, and it is the only one of the five the Host cannot influence: the signing key was generated inside the TA and never leaves secure storage.
 
-Only if all four pass does the server derive the session key:
+**Why (e) is not redundant with (a)–(d).** The AK belongs to the *fTPM*, not to the TA; it has no auth value, so any Normal-World process that can open `/dev/tpmrm0` can drive it. And the quote is assembled by the untrusted Host. So a root attacker can **bypass the TA entirely** — generate its own ECDH keypair in Normal World, have the real fTPM quote *that* key under the real PCR0, and complete the handshake itself. Checks (a)–(d) all pass; the server would report `attested=true, integrity=ok` while talking to attacker-controlled code. Check (e) is what makes `device_ecdh_pub` provably the TA's own ephemeral key. Binding `device_ecdh_pub` into the signed pre-image is the crux — a signature over the nonce alone could simply be replayed alongside a substituted key.
+
+Only if all five pass does the server derive the session key:
 
 ```
 session_key = HKDF-SHA256( ECDH(server_priv, device_ecdh_pub),
@@ -506,11 +516,17 @@ Enrollment record:
 ```json
 {"device_id":"iot-edge-01",
  "ak_pub_pem_b64":"<base64 of AK public PEM>",
+ "ta_pub_b64":"<base64 of the TA identity public point, raw 65-byte SEC1>",
  "expected_pcr":"  sha256:\n    0 : 0x...\n",
  "pcr_bank":"sha256:0"}
 ```
 
-The registry stores `{device_id → ak_pub_pem, expected_pcr, pcr_bank, created_at}` in `device_registry.json`, written atomically and `chmod 0600`. **That file mode is the entire authorization boundary** — whoever can edit the file is the admin. There is deliberately no admin token or force flag.
+The registry stores `{device_id → ak_pub_pem, ta_pub_b64, expected_pcr, pcr_bank, created_at}` in `device_registry.json`, written atomically and `chmod 0600`. **That file mode is the entire authorization boundary** — whoever can edit the file is the admin. There is deliberately no admin token or force flag.
+
+Two notes on `ta_pub_b64` (added with the TA-identity leg):
+
+- **It is a raw SEC1 point, not a PEM**, despite sitting next to `ak_pub_pem_b64`. The TA has no ASN.1 encoder and can only export `0x04 ‖ X ‖ Y`; every other public key on this wire uses the same 65-byte encoding. `ak_pub_pem` is PEM only because `tpm2_readpublic -f pem` happens to emit one. The server validates the point is actually on P-256 at registration, then re-encodes the base64 canonically so that cosmetic differences can never masquerade as a key change.
+- **It is required, and it is never backfilled.** A record enrolled without one cannot attest, and re-registering to add one is rejected with 409 — the same treatment as changing the AK. Allowing a backfill would reopen the very trust-on-first-use window this leg closes: registration is self-service, so root on a compromised device could resubmit the honest AK alongside a TA key of its own. The admin path is `scripts/reset-device-registry.sh` plus a server restart.
 
 Three behaviors:
 
@@ -644,9 +660,15 @@ The old `PROTECT_SENSOR_DATA` (id 2) is retired/unassigned.
 | 0 | `AUTHENTICATE_SENSOR` | NONE, NONE, NONE, NONE | — | HMAC-SHA256 challenge-response to the sensor via the PTA; sets `sensor_authenticated`. |
 | 1 | `READ_AND_PROTECT` | MEMREF_OUT, MEMREF_OUT, VALUE_OUT, NONE | — → nonce(12B), ct‖tag, seq | Reads a sensor reading via PTA, AES-256-GCM seals it. Requires both gates. |
 | 2 | *(retired)* | — | — | Old `PROTECT_SENSOR_DATA`; intentionally unassigned. |
-| 3 | `GENERATE_ATTESTATION_EVIDENCE` | MEMREF_OUT, MEMREF_IN, MEMREF_IN, MEMREF_OUT | nonce, server_ecdh_pub → device_ecdh_pub, transcript_hash | Handshake phase 1: ephemeral ECDH keygen + transcript hash. |
+| 3 | `GENERATE_ATTESTATION_EVIDENCE` | MEMREF_OUT, MEMREF_IN, MEMREF_IN, MEMREF_OUT | nonce, server_ecdh_pub → device_ecdh_pub, **evidence block (96B)** | Handshake phase 1: ephemeral ECDH keygen, transcript hash, **and the TA-identity signature**. |
 | 4 | `HANDSHAKE_COMPLETE` | MEMREF_IN ×4 | server_ecdh_pub, nonce, server_identity_pub, server_sig → — | Handshake phase 2: server TOFU auth + ECDH + HKDF session key. |
 | 5 | `PROVISION_SENSOR_SECRET` | MEMREF_IN, NONE, NONE, NONE | secret(32B) → — | One-time write of the sensor PSK into secure storage. |
+| 6 | `GENERATE_TA_IDENTITY` | MEMREF_IN, MEMREF_OUT, NONE, NONE | device_id → ta_pub(65B) | One-time ECDSA-P256 keygen **inside** the TA, sealed to `ciot.ta.identity` with the `device_id`. Idempotent for the same id; `ACCESS_CONFLICT` for a different one. |
+
+**Two things about CMD 3 worth knowing before you touch it:**
+
+- **`params[3]` carries two values, not one:** `transcript_hash(32) ‖ ta_sig(64)` = 96 bytes. This is not gratuitous packing — the GP Internal Core API caps a command at four parameters and all four were already in use. For the same reason `device_id` is *not* a parameter: the TA reads it from the identity object it sealed at provisioning, which has the useful side effect that the Host cannot assert a different identity per session, and a copied secure-storage image cannot be presented under another `device_id`.
+- **It hashes only TA-local copies.** `nonce`, `server_ecdh_pub` and `device_ecdh_pub` are memcpy'd into TA stack buffers before any digest touches them. Those `params[]` memrefs live in memory shared with Normal World, and a root Host can rewrite them from another thread mid-call — so hashing them in place would let it wait for the TA to write the public point and then swap in a key whose private half it holds, obtaining a genuine TA signature over an attacker's ECDH key. That is precisely the bypass this signature exists to prevent.
 
 Standard GP entry points: `TA_OpenSessionEntryPoint` zeroes a `confidential_iot_session`; `TA_CloseSessionEntryPoint` frees the ephemeral ECDH key, closes the cached PTA session, and wipes the whole session struct (session key + reading) before free.
 
@@ -671,6 +693,8 @@ This section answers the two questions directly: **what exactly is signed, and h
 | 2 | Handshake transcript | `nonce ‖ server_ecdh_pub ‖ device_ecdh_pub` | SHA-256 (hash only) | — | Binds a specific live handshake into the quote. |
 | 3 | **TPM quote** | `TPMS_ATTEST` = { PCR sha256:0 digest, qualifying data = transcript hash } | **ECDSA-P256 / SHA-256** | **fTPM AK @ `0x8101000A`** (restricted) | **The device runs measured firmware AND this quote is fresh for this session.** |
 | 4 | Server-identity auth | `"CC-IOT-1 server-identity" ‖ nonce ‖ server_ecdh_pub ‖ device_ecdh_pub` | ECDSA-P256 / SHA-256 (raw 64-byte r‖s) | Server identity key; verified against pinned `ciot.server.pubkey` | The device is talking to the genuine, pinned server. |
+| 4b | **TA-identity auth** | `"CC-IOT-1 ta-identity" ‖ nonce ‖ server_ecdh_pub ‖ device_ecdh_pub ‖ device_id` | ECDSA-P256 / SHA-256 (raw 64-byte r‖s) | **TA identity key `ciot.ta.identity`** (sealed in the TEE); verified against the registry's pinned `ta_pub_b64` | **The genuine TA — not a bypassed Normal World — produced this session's ECDH key.** |
+| 4c | TA binary loading | the `.ta` header + image hash | RSA-4096 / SHA-256 (OP-TEE `shdr_verify_signature`) | **`keys/ciot_ta.pem`** (project-private); public half compiled into OP-TEE core | Only TA binaries this project signed will load at all. |
 | 5 | Session key | ECDH shared secret; salt = nonce, info = `"CC-IOT-1 device-aead"` | HKDF-SHA256 → AES-256 | ephemeral ECDH → session key | Confidential channel bound to this attestation. |
 | 6 | Sensor-data seal | reading JSON; AAD = seq(8B BE) | AES-256-GCM (12B nonce, 16B tag) | session key | Confidentiality + integrity + ordering of each reading. |
 
@@ -683,7 +707,12 @@ flowchart LR
     MB["Measured boot (TF-A)<br/>measures BL31 / BL32=OP-TEE / BL33"] --> PCR["PCR sha256:0<br/>= identity of the firmware TCB"]
     PCR --> QUOTE["TPM quote<br/>AK signs PCR0 + transcript"]
     QUOTE --> VER["Server verifies:<br/>(a) PCR bound to quote<br/>(b) AK signature<br/>(c) transcript fresh<br/>(d) == expected_pcr baseline"]
-    VER --> GATE{"all 4 pass?"}
+    SIGN["Private TA signing key<br/>keys/ciot_ta.pem"] --> LOAD["OP-TEE core loads only<br/>TAs signed with it"]
+    LOAD --> SEAL["TA identity key sealed in<br/>secure storage (scoped to TA UUID)"]
+    SEAL --> TASIG["ta_sig over<br/>transcript ‖ device_id"]
+    TASIG --> VER2["Server verifies:<br/>(e) ta_sig under pinned ta_pub"]
+    VER --> GATE{"all 5 pass?"}
+    VER2 --> GATE
     GATE -- yes --> KEY["derive session key<br/>→ accept encrypted data"]
     GATE -- no --> REJECT["reject — no session key,<br/>no data accepted"]
 
@@ -691,13 +720,19 @@ flowchart LR
     style REJECT fill:#ffebee,stroke:#c62828
 ```
 
+The two legs answer different questions and neither replaces the other: the left branch proves **the firmware is genuine**, the right proves **the genuine TA did this session's work**. PCR0 cannot do the second (the app TA is not a boot image, so it is not measured), and the TA signature cannot do the first (a sealed key proves *a* genuine TEE unsealed it, not *which* firmware booted).
+
 **What PCR0 measures** (see [§8](#8-measured-boot-pcr--the-ftpm)): the firmware / secure-world TCB — the TF-A stages and **OP-TEE core (BL32)**, plus BL33 — measured by TF-A as each image loads, *before* control transfers to it, and extended into PCR0 by the fTPM.
 
-**How the TAs are covered.** The `confidential_iot` TA and the fTPM TA are *not* boot images, so they aren't in PCR0 directly. Instead, **OP-TEE core verifies every TA's signature before loading it**, using a verification key embedded in OP-TEE core. Because OP-TEE core is itself measured into PCR0, the chain closes: authentic OP-TEE (proven by PCR0) → loads only a validly-signed, unmodified TA → so **TA integrity is guaranteed transitively, rooted in PCR0**. A tampered `.ta` either fails signature verification and won't load, or (if the trusted key were swapped) changes OP-TEE core and therefore PCR0.
+**How the TAs are covered.** The `confidential_iot` TA and the fTPM TA are *not* boot images, so they aren't in PCR0 directly. Instead, **OP-TEE core verifies every TA's signature before loading it**, using a verification key compiled into OP-TEE core. Because OP-TEE core is itself measured into PCR0, the chain closes: authentic OP-TEE (proven by PCR0) → loads only a validly-signed, unmodified TA → so **TA integrity is guaranteed transitively, rooted in PCR0**. A tampered `.ta` either fails signature verification and won't load, or (if the trusted key were swapped) changes OP-TEE core and therefore PCR0.
+
+That transitive guarantee is only as strong as the signing key's secrecy, so this build signs with a **project-private RSA-4096 key** (`keys/ciot_ta.pem`), not OP-TEE's shipped default — whose private half is committed in the upstream tree and would let anyone re-sign a tampered TA. The key is threaded into the build as a single exported `TA_SIGN_KEY`, which reaches all three consumers that must agree on it (the core's baked-in verifier, the dev-kit export, and every TA link step). `scripts/verify-ta-signing.sh` asserts the core and the TA ended up with the same key at the end of every build, because a mismatch is otherwise a silent build success in which every TA then fails to load at runtime.
 
 Because the AK is a *restricted* fTPM key, it can only ever sign a real quote over the real PCRs — the Host cannot forge one. Because check (d) compares the quote's PCR digest to the enrollment baseline, **any change to a measured firmware image changes PCR0, breaks the match, and the server refuses to derive a session key.** No key ⇒ no data is ever accepted. That is the integrity guarantee.
 
-> Honesty note: the measurement is now rooted in the (emulated) boot firmware — TF-A measures each image *before* executing it, so the thing measured **is** the thing that runs. Two residual limitations remain: the **Linux kernel/rootfs and the untrusted Normal-World Host binary are not measured**, and the transitive TA guarantee is only as strong as the **TA signing key** (currently OP-TEE's shipped default dev key). See [§18](#18-known-limitations--security-caveats).
+**And because check (e) requires a signature the Host cannot produce**, a Normal World that loads the genuine firmware but then does the crypto *itself* is rejected too — the case measurement alone cannot catch.
+
+> Honesty note: the measurement is rooted in the (emulated) boot firmware — TF-A measures each image *before* executing it, so the thing measured **is** the thing that runs. The residual limitation is coverage: the **Linux kernel/rootfs and the untrusted Normal-World Host binary are not measured**. The Host being unmeasured is by design (it is outside the TCB, and check (e) is what stops it substituting itself for the TA); the kernel/rootfs gap is real. See [§18](#18-known-limitations--security-caveats).
 
 ---
 
@@ -771,17 +806,19 @@ The adversary can **fully compromise Normal World** (the Host / Linux) **but not
 
 ### The recurring principle: never trust the counterpart's self-report
 
-Applied at three layers, each enforced inside a boundary the adversary can't cross:
+Applied at four layers, each enforced inside a boundary the adversary can't cross:
 
 | Layer | Who verifies whom | Enforcement point |
 |---|---|---|
-| Server ↔ Device | Server verifies the device's TPM quote (4 checks) | `AttestationVerifier` — never a device-claimed `attested` flag. |
+| Server ↔ Device | Server verifies the device's TPM quote (checks a–d) | `AttestationVerifier` — never a device-claimed `attested` flag. |
+| Server ↔ TA | Server verifies the TA's identity signature (check e) | `verify_and_derive` — the key was generated in the TEE and never left it, so the Host cannot produce this signature even as root. |
 | Sensor ↔ Device | TA verifies the sensor's HMAC | `sensor_authenticated` gate lives in the TA; set only by `TEE_MACCompareFinal`. |
 | Device ↔ Server | TA verifies the server's identity signature | `authenticate_server()` TOFU verdict lives in the TA. |
 
 ### Guarantees
 
 - **Session key never leaves the TA** (device side). ECDH/HKDF/AES-GCM all happen inside `confidential_iot`; the fTPM is only a signing oracle over public data.
+- **The session key provably belongs to the genuine TA.** Root can drive the fTPM and assemble a quote, but cannot sign the TA-identity pre-image — so it cannot get the server to derive a key against an ECDH keypair it controls. This holds for devices whose *first* enrollment was honest; see [§18](#18-known-limitations--security-caveats) for the TOFU caveat that bounds it.
 - **Freshness / anti-replay** at two scales: the 32-byte server nonce per challenge (session-level) and the authenticated monotonic `seq` in the GCM AAD (per-message). GCM proves *valid encryption* but not *freshness* — hence the separate seq. Uniqueness (nonce) and ordering (seq) are kept as separate jobs.
 - **Two independent trust gates** on the session key (device-verifies-server AND server-verifies-device).
 - **Reject-on-mismatch** prevents silent identity takeover (HTTP 409).
@@ -796,12 +833,13 @@ Applied at three layers, each enforced inside a boundary the adversary can't cro
 
 1. **Measured boot is real now, but its coverage and root have limits.** PCR0 reflects the actual firmware boot chain (TF-A stages + OP-TEE core), delivered via the FF-A / S-EL1 SPMC topology and `project/patches/tfa-tos-fw-config-eventlog.patch` ([§8](#8-measured-boot-pcr--the-ftpm)). Three honest residuals remain:
    - **Coverage stops at the firmware.** The Linux kernel and rootfs are **not** measured (the chain isn't extended into U-Boot/Linux via, e.g., IMA/dm-verity), and the untrusted Normal-World Host binary is **not** measured (acceptable — it's outside the TCB by design; all gates live in the TA).
-   - **TA integrity depends on the signing key.** TAs are covered transitively via OP-TEE's signed-TA loading, but this build uses OP-TEE's **shipped default development key** (`TA_SIGN_KEY ?= keys/default_ta.pem`). Anyone with the public OP-TEE tree can re-sign a tampered TA with it. For the transitive guarantee to be robust, sign TAs with a **private** key (set `TA_SIGN_KEY`) — a straightforward hardening, out of scope here.
    - **The root of trust is emulated.** On QEMU there is no immutable BootROM or fused key; TF-A itself is the measurement root. It is "firmware-rooted" in that the *measurer* is the boot firmware (not the untrusted OS), but not silicon-rooted.
-2. **Automatic rebuild-reset of TOFU/AK is a dev convenience.** It is deliberately coupled to a full disk wipe (new AK) so it can't be a quiet bypass, but on real hardware re-pinning would be operator-controlled, not automatic.
-3. **First-come-first-served self-registration.** Nothing stops a fake device pre-registering a made-up `device_id`. The only guarantee is *no silent takeover of an already-registered ID*. Real deployments would gate enrollment behind an authority.
-4. **QEMU stable HUK / EPS.** The Hardware Unique Key and Endorsement Primary Seed are stable software values under emulation — they are *not* real secrets. This is what makes secure storage decryptable across reboots in the first place, but it means the roots of trust are simulation-grade.
-5. **Documentation drift in Docker files.** `Dockerfile` / `docker-compose.yml` still default `MS_DEVICE_LINK=stub` and mention an `aesgcm` user-security mode — both are **stale**. The current code has no `stub` link (`get_device_link()` would raise) and no `aesgcm` mode. Use `MS_DEVICE_LINK=attested_network` and `MS_USER_SECURITY=tls`. (These files also still show 8000/9000; see [§16](#16-networking--deployment).)
+   - **The TA signing key is committed to the repo.** `keys/ciot_ta.pem` is private *relative to the world* — which is the property that matters, since the alternative was the universally-known upstream key — but anyone with repo access has it. The repo is not on the device, and the key never enters the firmware image or rootfs. A production posture would keep it out of tree (or in an HSM) and inject the path at build time; `TA_SIGN_KEY` already supports that with no code change. See [`keys/README.md`](../keys/README.md).
+2. **The TA-identity guarantee is bounded by trust-on-first-use.** Check (e) proves the genuine TA produced a session's ECDH key — but only for devices whose **first** enrollment was honest. Registration is self-service with no client authentication beyond TLS, so root on a device that was *never* enrolled can pin a TA key of its own choosing at enrollment time, and everything downstream will verify correctly against it. This is the same posture the AK has always had, and it is why re-registration with a changed key is a hard 409 rather than an update: the guarantee is *no silent takeover of an established identity*, not *only genuine devices can ever enroll*. See caveat 4 below.
+3. **Automatic rebuild-reset of TOFU/AK is a dev convenience.** It is deliberately coupled to a full disk wipe (new AK) so it can't be a quiet bypass, but on real hardware re-pinning would be operator-controlled, not automatic.
+4. **First-come-first-served self-registration.** Nothing stops a fake device pre-registering a made-up `device_id`. The only guarantee is *no silent takeover of an already-registered ID*. Real deployments would gate enrollment behind an authority.
+5. **QEMU stable HUK / EPS.** The Hardware Unique Key and Endorsement Primary Seed are stable software values under emulation — they are *not* real secrets. This is what makes secure storage decryptable across reboots in the first place, but it means the roots of trust are simulation-grade.
+6. **Documentation drift in Docker files.** `Dockerfile` / `docker-compose.yml` still default `MS_DEVICE_LINK=stub` and mention an `aesgcm` user-security mode — both are **stale**. The current code has no `stub` link (`get_device_link()` would raise) and no `aesgcm` mode. Use `MS_DEVICE_LINK=attested_network` and `MS_USER_SECURITY=tls`. (These files also still show 8000/9000; see [§16](#16-networking--deployment).)
 
 ---
 
@@ -819,16 +857,19 @@ Applied at three layers, each enforced inside a boundary the adversary can't cro
 | Other ports | `QEMU_SENSOR_PORT` default 54322, gdbstub base 1234 |
 | HKDF device info label | `"CC-IOT-1 device-aead"` |
 | Server-identity label | `"CC-IOT-1 server-identity"` |
+| TA-identity label | `"CC-IOT-1 ta-identity"` |
 | Server sig / identity pubkey | 64-byte raw `r‖s` / 65-byte SEC1 point |
+| TA sig / TA identity pubkey | 64-byte raw `r‖s` / 65-byte SEC1 point |
 | Session TTL | 3600 s; challenge TTL 30 s; push interval ~3 s |
-| Sizes | attestation nonce 32B · GCM nonce 12B · GCM tag 16B · seq AAD 8B big-endian · sensor secret 32B · READING_MAX 256B · device ECDH pub 65B |
-| Secure-storage object IDs | `ciot.server.pubkey` (TOFU pin) · `ciot.sensor.psk` (sensor PSK) |
+| Sizes | attestation nonce 32B · GCM nonce 12B · GCM tag 16B · seq AAD 8B big-endian · sensor secret 32B · READING_MAX 256B · device ECDH pub 65B · CMD 3 evidence block 96B (32 hash + 64 sig) · sealed TA identity blob 160B · `device_id` ≤ 63B |
+| Secure-storage object IDs | `ciot.server.pubkey` (TOFU pin) · `ciot.sensor.psk` (sensor PSK) · `ciot.ta.identity` (TA identity keypair + bound `device_id`) |
+| TA signing key | `keys/ciot_ta.pem` (RSA 4096) — exported as `TA_SIGN_KEY` by `scripts/build.sh`; asserted by `scripts/verify-ta-signing.sh` |
 | Curve / algorithms | P-256 (secp256r1) everywhere; ECDSA-P256-SHA256 · ECDH-P256 · HKDF-SHA256 · AES-256-GCM · HMAC-SHA256 |
 | TEE algorithm IDs | `TEE_ALG_ECDH_P256`, `TEE_ALG_HKDF_SHA256_DERIVE_KEY`, `TEE_ALG_AES_GCM`, `TEE_ALG_SHA256`, `TEE_ALG_ECDSA_P256`, `TEE_ALG_HMAC_SHA256` |
 | TPM magic numbers | `TPM_GENERATED_VALUE=0xFF544347`, `TPM_ST_ATTEST_QUOTE=0x8018`, `TPM_ALG_SHA256=0x000B`, `TPM_ALG_ECDSA=0x0018` |
 | Persistent state disk | `.device-state/iot-edge-NN.img`, 64MB ext4 → `/dev/vda` → `/var/lib/tee` via `S29tee-storage` |
-| Key files | `/etc/confidential_iot/device.conf`, `enrollment.json`, `CC_Server/server/device_registry.json`, `server/certs/{server_key,server_cert,server_identity_key}.pem`, `.build-stamp` |
+| Key files | `/etc/confidential_iot/device.conf`, `enrollment.json`, `CC_Server/server/device_registry.json`, `server/certs/{server_key,server_cert,server_identity_key}.pem`, `keys/ciot_ta.pem`, `.build-stamp` |
 
 ---
 
-*End of design document (draft). Cross-references: `docs/ATTESTATION_DESIGN.md`, `docs/CONNECTION_INITIATION.md`, `docs/SENSOR_PATH_IMPLEMENTATION.md`, `docs/SERVER_AUTHENTICATION_IMPLEMENTATION.md`, `docs/PERSISTENT_AK_IMPLEMENTATION.md`, `docs/SELF_REGISTRATION_IMPLEMENTATION.md`, `docs/QEMU_NETWORKING.md`, `docs/TERMINOLOGY.md`, `docs/ATTESTATION_TESTING.md`.*
+*End of design document (draft). Cross-references: `docs/ATTESTATION_DESIGN.md`, `docs/CONNECTION_INITIATION.md`, `docs/SENSOR_PATH_IMPLEMENTATION.md`, `docs/SERVER_AUTHENTICATION_IMPLEMENTATION.md`, `docs/TA_IDENTITY_IMPLEMENTATION.md`, `docs/PERSISTENT_AK_IMPLEMENTATION.md`, `docs/SELF_REGISTRATION_IMPLEMENTATION.md`, `docs/RESET_DEVICE_REGISTRY.md`, `docs/QEMU_NETWORKING.md`, `docs/TERMINOLOGY.md`, `docs/ATTESTATION_TESTING.md`, `keys/README.md`.*

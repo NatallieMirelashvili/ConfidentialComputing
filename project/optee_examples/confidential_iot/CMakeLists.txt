@@ -26,7 +26,7 @@ install(PROGRAMS scripts/provision-device.sh
 
 # Must run before /etc/init.d/S30optee (tee-supplicant) so OP-TEE's REE-FS
 # secure storage mounts onto the persistent disk first. See
-# scripts/S29tee-storage and docs/HANDOFF_persistentAK.md.
+# scripts/S29tee-storage.
 install(PROGRAMS scripts/S29tee-storage
 	DESTINATION /etc/init.d)
 

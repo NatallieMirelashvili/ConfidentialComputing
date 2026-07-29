@@ -129,10 +129,10 @@ sequenceDiagram
     S-->>D: attest_challenge - nonce, server_ecdh_pub, server_identity_pub
     Note over S,D: server DRIVES attestation, nonce originates at the server
 
-    D->>D: TA makes ephemeral ECDH key, fTPM quotes transcript hash
-    D-->>S: attest_response - quote, signature, pcr_values
+    D->>D: TA makes ephemeral ECDH key + signs it with its sealed identity key,<br/>fTPM quotes transcript hash
+    D-->>S: attest_response - quote, signature, pcr_values, ta_sig
 
-    Note over S: verify signature, PCR digest, freshness, PCR baseline
+    Note over S: verify signature, PCR digest, freshness, PCR baseline,<br/>and ta_sig under the pinned TA identity key
     S->>S: sign transcript with server-identity key
     S-->>D: attest_result ok true, server_sig
     Note over D: TA verifies server_sig and PINS server_identity_pub (TOFU),<br/>then derives the session key - mismatch/bad sig = refuse
