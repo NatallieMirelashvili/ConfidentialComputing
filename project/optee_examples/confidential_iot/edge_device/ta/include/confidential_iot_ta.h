@@ -137,15 +137,34 @@
 /*
  * One-time provisioning of the Sensor Module's pre-shared secret into this
  * TA's secure storage (TEE_STORAGE_PRIVATE, object id "ciot.sensor.psk").
- * Never compiled into source - one device image is shared fleet-wide, so
- * each device+sensor pairing's secret is installed at pairing time by
- * scripts/pair-sensor.sh, mirroring how scripts/provision-device.sh installs
- * the per-device Attestation Key into the fTPM rather than the binary.
- * Idempotent: refuses to overwrite an already-provisioned secret
- * (TEE_ERROR_ACCESS_CONFLICT), matching provision-device.sh's AK-exists gate.
+ * Never compiled into source - one device image is shared fleet-wide, so the
+ * secret is per-pairing, mirroring how scripts/provision-device.sh installs the
+ * per-device Attestation Key into the fTPM rather than the binary.
  *
- * in:  params[0].memref = TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE-byte secret.
- * out: none.
+ * The TA PULLS the secret from the Sensor Module over the sensor_link PTA's
+ * secure UART2, which Normal World cannot address. The Host CA only triggers
+ * this command; it passes nothing and receives nothing but a result code, so
+ * the secret never enters a Host-owned buffer in any run. That is what the
+ * empty parameter shape buys, and it cuts both ways: a compromised Host can
+ * neither learn the secret nor inject one of its own to pair this device to a
+ * sensor it controls.
+ *
+ * Idempotent and safe to invoke on every boot: if the secret is already sealed
+ * the command returns TEE_SUCCESS without emitting a single byte on the link.
+ * That short-circuit is required, not merely efficient - the Sensor Module
+ * serves its secret at most once per power-on, so a re-fetch would waste the
+ * one chance a genuinely unprovisioned device needs.
+ *
+ * ORDERING: must be invoked before CMD 0 for a given device generation. The
+ * Sensor Module starts pushing unsolicited readings once a challenge has
+ * succeeded, and those would desync the secret exchange.
+ *
+ * in:  none; out: none.
+ *
+ * Result: TEE_SUCCESS, TEE_ERROR_BAD_PARAMETERS (any parameter is non-NONE),
+ * TEE_ERROR_ACCESS_DENIED (the Sensor Module already served its one-shot
+ * secret - restart it), TEE_ERROR_COMMUNICATION (sensor link dead or the reply
+ * was malformed), or a storage error.
  */
 #define TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET	5
 
@@ -248,6 +267,8 @@
  * raw[600], ct_b64[900], main.c's protected_data[512]) unchanged - see
  * edge_device.c. Grow all of those together if this ever needs to grow. */
 #define TA_CONFIDENTIAL_IOT_READING_MAX			256
+/* Must equal SENSOR_LINK_SECRET_SIZE in pta_sensor_link.h and
+ * sensor_module/sensor_link_proto.h - the same 32 bytes cross the link. */
 #define TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE			32
 
 #endif /* CONFIDENTIAL_IOT_TA_H */

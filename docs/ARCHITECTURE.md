@@ -29,9 +29,15 @@ project/optee_examples/confidential_iot/
 ├── host/edge_device.c       device orchestration: session, attest, send
 ├── host/net.c                raw TCP socket helpers
 ├── attestation/               fTPM quote/signature generation
+├── tests/host/                 device-side TA security tests — a deliberately
+│                                hostile Host CA (see docs/ATTESTATION_TESTING.md §2a)
 └── sensor_module/sensor_daemon.c   Sensor Module companion process (see
                                      docs/SENSOR_PATH_IMPLEMENTATION.md) —
                                      runs OUTSIDE the QEMU guest
+
+project/optee_examples/ciot_probe_ta/   test fixture: same signing key, different
+                                          UUID — must NOT see the real TA's storage
+project/optee_examples/ciot_rogue_ta/   test fixture: attacker-signed — must NOT load
 
 project/optee_os_ext/core/pta/sensor_link.c   the sensor_link PTA (owns the
                                                 secure UART2, see above)

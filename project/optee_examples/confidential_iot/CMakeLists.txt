@@ -21,6 +21,31 @@ target_link_libraries(optee_example_confidential_iot_edge
 install(TARGETS optee_example_confidential_iot_edge
 	DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# Device-side TA security tests: a deliberately hostile Host CA. It does NOT link
+# edge_device.c - it is simulating a compromised Normal World, so it drives the TA
+# directly (see tests/host/ta_tests.c). It needs the headers of the two TA test
+# fixtures, which live in their own top-level example dirs because the Buildroot
+# package builds exactly one TA per dir (*/ta/Makefile).
+add_executable(optee_example_confidential_iot_tests
+	tests/host/ta_tests.c
+	tests/host/crypto_check.c)
+
+target_include_directories(optee_example_confidential_iot_tests
+	PRIVATE tests/host
+	PRIVATE edge_device/ta/include
+	PRIVATE ../ciot_probe_ta/ta/include
+	PRIVATE ../ciot_rogue_ta/ta/include)
+
+# mbedcrypto here is the verifying side of the attestation protocol (SHA-256,
+# ECDSA-P256, P-256 keygen) - the tests recompute what the management server
+# checks, so they can prove the device never produces forgeable evidence without
+# a server or a network in the loop.
+target_link_libraries(optee_example_confidential_iot_tests
+	PRIVATE teec mbedcrypto)
+
+install(TARGETS optee_example_confidential_iot_tests
+	DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 install(PROGRAMS scripts/provision-device.sh
 	DESTINATION ${CMAKE_INSTALL_BINDIR})
 

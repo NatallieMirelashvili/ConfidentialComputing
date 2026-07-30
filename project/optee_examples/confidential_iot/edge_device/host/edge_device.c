@@ -32,7 +32,10 @@ static char g_device_id[64] = "iot-edge-01";
 static char g_server_host[64] = "127.0.0.1";
 static uint16_t g_server_port = 9000;
 static char g_ak_handle[32] = "0x8101000A";
-/* Management-server admin API port (POST /api/devices/register), distinct
+/* Unused while self-registration is disabled (see the #if 0 block below), but
+ * still parsed from device.conf so re-enabling needs no config change.
+ *
+ * Management-server admin API port (POST /api/devices/register), distinct
  * from g_server_port (the device-facing attestation port). Same host. */
 static uint16_t g_admin_port = 8000;
 
@@ -307,13 +310,15 @@ static int ta_read_and_protect_encode(char *output, size_t output_size)
 
 /*
  * One-time provisioning trigger for the Sensor Module's pre-shared secret
- * (see scripts/pair-sensor.sh and ta_provision_sensor_secret in
- * trusted_app.c). The secret transits this Normal-World buffer once, at
- * pairing time - an accepted, documented trust assumption inherent to any
- * shared-secret provisioning step on this emulated platform, distinct from
- * the ongoing sensor-data path this project's hard requirement is about.
+ * (see ta_provision_sensor_secret in trusted_app.c).
+ *
+ * No secret passes through this process. The TA pulls it from the Sensor
+ * Module over the sensor_link PTA's secure UART2, which this Normal World
+ * cannot address, so the plaintext never reaches a Host-owned buffer - not
+ * here, not in argv, not in TEEC shared memory. All this call carries is the
+ * request itself and, back, a result code.
  */
-int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+int edge_provision_sensor_secret(void)
 {
 	TEEC_Operation op;
 	TEEC_Result res;
@@ -323,10 +328,8 @@ int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR
 		return -1;
 
 	memset(&op, 0, sizeof(op));
-	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE,
 					  TEEC_NONE, TEEC_NONE);
-	op.params[0].tmpref.buffer = (void *)secret;
-	op.params[0].tmpref.size = TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE;
 
 	res = TEEC_InvokeCommand(&g_teec_sess,
 				  TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET,
@@ -391,9 +394,8 @@ static int ta_read_and_protect_encode(char *output, size_t output_size)
 	return -1;
 }
 
-int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+int edge_provision_sensor_secret(void)
 {
-	(void)secret;
 	return -1;
 }
 
@@ -587,6 +589,21 @@ int edge_attest_to_server(void)
 	return 0;
 }
 
+/*
+ * DISABLED: device self-registration.
+ *
+ * Registration is now a deliberate operator step, done from the dev host with
+ * scripts/register-device.sh (or by POSTing /etc/confidential_iot/enrollment.json
+ * by hand). The device no longer enrols itself, so admitting a new device is an
+ * explicit decision rather than a side effect of booting it.
+ *
+ * Kept as #if 0 rather than deleted so re-enabling is a one-line change: flip
+ * this to #if 1 and restore the rc == -2 branch in edge_ensure_session() below.
+ * Note this block is the Host CA's ONLY use of system() and of curl - with it
+ * disabled the CA shells out to nothing, and the guest's curl dependency
+ * (project/buildroot/packages.conf) is only still needed if you re-enable it.
+ */
+#if 0
 #define CIOT_ENROLLMENT_PATH "/etc/confidential_iot/enrollment.json"
 #define CIOT_REGISTER_RESP_PATH "/tmp/ciot_register_resp.json"
 
@@ -647,6 +664,7 @@ static int edge_register_with_server(void)
 	cJSON_Delete(msg);
 	return 0;
 }
+#endif /* disabled self-registration */
 
 int edge_ensure_session(void)
 {
@@ -659,13 +677,22 @@ int edge_ensure_session(void)
 
 	rc = edge_attest_to_server();
 	if (rc == -2) {
+		/* Self-registration disabled (see the #if 0 block above). The
+		 * device reports and gives up for this cycle rather than
+		 * enrolling itself; main()'s loop retries, so registering it
+		 * later is picked up on the next attempt with no restart. */
 		fprintf(stderr,
-			"edge_device: not registered, attempting self-registration...\n");
-		if (edge_register_with_server() != 0)
-			return -1;
-		/* Same connection, repeat "hello" - already how device-driven
-		 * re-attestation works (see edge_attest_to_server()). */
-		rc = edge_attest_to_server();
+			"edge_device: not registered with the management server - "
+			"register it from the dev host (scripts/register-device.sh), "
+			"then this will succeed on the next retry\n");
+		return -1;
+		/*
+		 * Previous self-registration path, kept for easy revert:
+		 *
+		 * if (edge_register_with_server() != 0)
+		 *         return -1;
+		 * rc = edge_attest_to_server();
+		 */
 	}
 	if (rc != 0)
 		return -1;

@@ -32,13 +32,15 @@ void edge_device_shutdown(void);
 int edge_authenticate_sensor(void);
 
 /*
- * One-time provisioning trigger for the Sensor Module's pre-shared secret -
- * see scripts/pair-sensor.sh, which drives this. `secret` must be exactly
- * TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE bytes. Idempotent: re-provisioning
- * an already-provisioned device is a no-op success (see
- * ta_provision_sensor_secret in trusted_app.c).
+ * One-time provisioning trigger for the Sensor Module's pre-shared secret.
+ * Takes no secret and returns none: the TA pulls it from the Sensor Module
+ * itself over the secure UART, so this process only asks for the pairing to
+ * happen and learns whether it did - exactly like edge_authenticate_sensor()
+ * above. Idempotent: on an already-paired device the TA short-circuits without
+ * touching the link (see ta_provision_sensor_secret in trusted_app.c).
+ * Returns 0 on success.
  */
-int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE]);
+int edge_provision_sensor_secret(void);
 
 /*
  * One-time provisioning trigger for the TA's OWN identity keypair - see

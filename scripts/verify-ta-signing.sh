@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Description: Assert the OP-TEE core and the confidential_iot TA were built with the
-# same project-private TA signing key (docs/HANDOFF_taIdentityBinding.md Part A).
+# same project-private TA signing key.
 #
 # Why this exists: TA_SIGN_KEY feeds two independent halves of the build - the core
 # bakes the PUBLIC key into ta_pub_key.c (the load-time verifier), and each TA link

@@ -105,6 +105,131 @@ gcc -Wall -Wextra -fsyntax-only -I "$TA_INC" \
 (Requires having run `scripts/bootstrap.sh` + at least one build already,
 so `optee_os/out/...` exists.)
 
+## 2a. Device-side TA security tests (in the guest, needs a built image)
+
+Everything in §1 tests the **server**: that its verifier rejects forged evidence.
+`optee_example_confidential_iot_tests` is the mirror image — it runs **inside the
+guest**, as root, and attacks the TA the way a root-compromised Normal World would,
+proving the device never *produces* forgeable evidence. Source lives in
+`project/optee_examples/confidential_iot/tests/host/`.
+
+It is deliberately not built on `edge_device.c`: it is simulating a hostile Host, so
+it opens its own TEEC session, invokes commands out of order and with malformed
+parameters, substitutes keys it generated itself, and rewrites `/lib/optee_armtz`. It
+plays the *server's* verifying role locally with mbedTLS, so no server and no network
+are involved.
+
+Run it after boot and provisioning, with the edge daemon stopped (Ctrl-C — it is
+one-run-per-boot by design, see §6.6; the tests do not restart it):
+
+```sh
+optee_example_confidential_iot_tests          # all 5
+optee_example_confidential_iot_tests -t 3     # just one
+optee_example_confidential_iot_tests -l       # list them
+```
+
+Expect `CIOT_TESTS_DONE=0` on the last line; the exit code is the number of failed
+checks, and the sentinel matches `provision-device.sh`'s `CIOT_PROVISION_DONE=`
+convention so a tmux-driven runner can wait on it.
+
+| Test | What it proves |
+|---|---|
+| 1. UUID mimicry | A TA signed with anything but `keys/ciot_ta.pem` will not load — under its own UUID, planted at the genuine UUID's path, or byte-flipped. This is Part A, executable. |
+| 2. Storage scoping | `ciot.ta.identity`, `ciot.sensor.psk` and `ciot.server.pubkey` are `ITEM_NOT_FOUND` from a *different* TA UUID, with a self round-trip under the prober's own `ciot.probe.control` as the control. The premise behind "Part A gates Part B". Also asserts the `sensor_link` PTA refuses a Normal-World caller, so the Host cannot read sensor plaintext off the secure UART directly. |
+| 3. Faked attestation | `ta_sig` verifies over the TA's own ECDH key and **not** over an attacker-generated one, another device's id, or a previous session. The compromised-Host bypass, from the device end. |
+| 4. Lying Host | `READ_AND_PROTECT` without a session, `HANDSHAKE_COMPLETE` without evidence, and a forged server-identity signature are all refused TA-side, and no session key is derived. |
+| 5. Identity immutability | The sealed identity re-exports idempotently, refuses to rebind to another `device_id`, and survives every malformed parameter with a clean GP error rather than a panic. |
+
+Three things worth knowing before reading a result:
+
+- **Test 1 rewrites `/lib/optee_armtz` and restores it.** That is safe by
+  construction: the rootfs is an initramfs (`out-br/images/rootfs.cpio.gz`), so the
+  writes are RAM-only and a reboot undoes them regardless. It backs the genuine TA up
+  to `/tmp/ciot-genuine-ta.bak` first and re-opens it at the end as a control, so a
+  failed restore can never read as a pass. If that last control fails, reboot.
+- **Test 4 never presents a validly-signed attacker server key.** The server identity
+  is pinned Trust-On-First-Use, so doing that while nothing is pinned would pin the
+  attacker's key and permanently break the device. The signature is always random and
+  the return code discriminates the state without risking a write:
+  `ACCESS_CONFLICT` = already pinned, impersonation rejected on sight;
+  `SIGNATURE_INVALID` = nothing pinned yet, rejected at verification before the pin.
+  Both are passes, and the test reports which it saw.
+- **Tests 3 and 5 refuse to run on an unprovisioned device.** They drive `CMD 6`,
+  which seals the TA identity first-write-wins, so a guessed `device_id` would be
+  sealed permanently and every later `provision-device.sh` run would then fail with
+  `TEE_ERROR_ACCESS_CONFLICT` until the secure storage is wiped. If
+  `/etc/confidential_iot/device.conf` has no `device_id` and `CIOT_DEVICE_ID` is
+  unset, they report that and stop rather than guess.
+
+Test 3 opens with a **known-answer check on its own pre-image builders**, using the
+same vectors `test_ta_identity_preimage_is_byte_exact` pins on the server. So the
+C/Python parity lock now runs on the device too, and a byte-parity bug reports itself
+as "known-answer digest mismatch" instead of masquerading as a broken TA signature.
+
+### The two TA fixtures
+
+Test 1 and 2 need TAs, and the Buildroot hook builds exactly one per top-level example
+dir (`*/ta/Makefile`), so each gets its own:
+
+| Dir | UUID | Signed with | Must |
+|---|---|---|---|
+| `project/optee_examples/ciot_probe_ta` | `…-0004` | the project key | load, and fail to see another TA's objects |
+| `project/optee_examples/ciot_rogue_ta` | `…-0003` | `ta/attacker_ta.pem` (committed, publicly known, worthless) | **not** load |
+
+**Before adding another UUID in the `7d9f6d20-5f11-4d0c-9a17-61c9c91c00xx` range,
+read the allocation table in `ciot_probe_ta/ta/include/ciot_probe_ta.h` — and check
+`project/optee_os_ext/` too, not just the TAs.** `…-0002` is the `sensor_link` PTA.
+The prober was originally built at that UUID and *silently did not work*: OP-TEE
+resolves pseudo-TAs before user TAs, so the PTA shadowed the `.ta` file completely and
+the session open was refused by the PTA's own caller check — `ACCESS_DENIED` with
+origin `TRUSTED_APP`, from a fixture that was built, installed and correctly signed but
+never consulted. Nothing in the build warns about this.
+
+The signing key is the *only* difference between them — one `override TA_SIGN_KEY`
+line in `ciot_rogue_ta/ta/Makefile`, which beats the `TA_SIGN_KEY` that
+`scripts/build.sh` exports. Both install to `/lib/optee_armtz` under their own
+filenames, so neither can collide with the genuine TA; the mimicry happens at runtime.
+`project/optee_examples/ciot_rogue_ta/README.md` has the commands to confirm each
+fixture really is signed with the key it claims — worth running if test 1 ever passes
+suspiciously easily, since a rogue that accidentally carries a valid project signature
+would make the whole test vacuous.
+
+Every failing line prints the raw `TEEC_Result` and, for session opens, the error
+origin. A fixture that is **present but will not load** is called out as such, and the
+reason is on the secure console (tmux window 0) — a fixture failing to load is an
+infrastructure problem with the test, not a finding about the real TA, and the two
+should never be confused.
+
+### Checking the suite is load-bearing
+
+Same idea as the mutation testing done on the server tests. Each of these should make
+the named test **fail**:
+
+- remove the `override TA_SIGN_KEY` line from `ciot_rogue_ta/ta/Makefile` → test 1
+  (the rogue then loads like any other TA);
+- change `sign_ta_identity()` to sign over anything other than the key the TA just
+  generated — e.g. hash `params[2]` (the server's key) in place of `device_pub` → test 3;
+- make `authenticate_server()` return `TEE_SUCCESS` unconditionally, or remove
+  `ta_handshake_complete()`'s `sess->ecdh_keypair == TEE_HANDLE_NULL` check → test 4.
+
+Note that removing the `!sess->session_key_valid` guard in `ta_read_and_protect()` would
+**not** fail test 4: the `!sess->sensor_authenticated` check precedes it and returns the
+same `TEE_ERROR_BAD_STATE`, so `CMD 1` never reaches the session-key gate in a test
+session that has not authenticated a sensor.
+
+**Not covered by any test: the shared-memory race.** `ta_generate_attestation_evidence()`
+copies `nonce`, `server_pub` and `device_pub` into TA-local buffers before hashing them,
+because a root Host can rewrite the `params[]` memrefs from another thread while the
+command runs (correction #3 in `docs/TA_IDENTITY_IMPLEMENTATION.md` §6). Reverting those
+copies would **not** fail test 3 — the test is single-threaded and never touches the
+buffers mid-call, so it would still see a correct signature. Exercising it needs a
+concurrent writer racing `CMD 3`, which the suite does not do.
+
+While the suite runs, the secure console (tmux window 0) should show TA
+signature/hash verification failures during test 1 — `shdr_verify_signature` for the
+attacker-signed legs, a payload hash mismatch for the byte-flipped one — and **no**
+`TA panicked` anywhere.
+
 ## 3. Full loop: build and boot the real image
 
 From the project root (`ConfidentialComputing/`):

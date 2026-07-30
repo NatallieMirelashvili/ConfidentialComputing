@@ -143,11 +143,16 @@ if [[ ! -f "$DEVICE_DISK_IMG" ]]; then
 fi
 QEMU_EXTRA_ARGS="$QEMU_EXTRA_ARGS -drive if=none,file=$DEVICE_DISK_IMG,format=raw,id=hd1 -device virtio-blk-device,drive=hd1"
 
-# Sensor Module pairing secret, host-side copy (see scripts/pair-sensor.sh
-# and sensor_module/sensor_daemon.c's --secret). Same per-instance naming
-# convention as DEVICE_DISK_IMG above.
+# The Sensor Module's burned-in pre-shared key (see scripts/pair-sensor.sh and
+# sensor_module/sensor_daemon.c's --secret). NOT a copy of something the device
+# holds: this is the authoritative source, and the device has no copy until it
+# pulls one over the secure UART. Same per-instance naming convention as
+# DEVICE_DISK_IMG above. Deliberately NOT wiped by the rebuild reset near the
+# top of this script - the sensor's key is burned in, only the device is reset.
 SENSOR_SECRET_FILE="${SENSOR_SECRET_FILE:-$DEVICE_STATE_DIR/iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1))).sensor-secret}"
 SENSOR_DAEMON_BIN="${SENSOR_DAEMON_BIN:-$ROOT_DIR/project/optee_examples/confidential_iot/sensor_module/sensor_daemon}"
+SENSOR_DAEMON_LOG="$DEVICE_STATE_DIR/iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1))).sensor-daemon.log"
+SENSOR_DAEMON_PIDFILE="$DEVICE_STATE_DIR/iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1))).sensor-daemon.pid"
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for the automated project run." >&2
@@ -181,21 +186,59 @@ if tmux has-session -t "$QEMU_TMUX_SESSION" 2>/dev/null; then
   exec tmux attach-session -t "$QEMU_TMUX_SESSION"
 fi
 
-# Generate/reuse the Sensor Module pairing secret and start sensor_daemon
+# Burn the Sensor Module's key (if it has none yet) and start sensor_daemon
 # listening BEFORE QEMU launches: QEMU's 3rd -serial backend
 # (QEMU_SENSOR_PORT) connects out to it as a TCP client at machine-init time,
 # not lazily on first UART access - if nothing is listening yet, QEMU fails
-# to start at all ("Failed to connect ... Connection refused"). Pushing the
-# secret into the TA itself (over the guest console) still has to wait for
-# login, below - only the daemon *process* needs to be up this early.
-SENSOR_SECRET_B64=$("$ROOT_DIR/scripts/pair-sensor.sh" "$SENSOR_SECRET_FILE")
-if [[ -x "$SENSOR_DAEMON_BIN" ]]; then
-  "$SENSOR_DAEMON_BIN" --port "$QEMU_SENSOR_PORT" --secret "$SENSOR_SECRET_FILE" \
-    >"$DEVICE_STATE_DIR/iot-edge-$(printf '%02d' $((QEMU_INSTANCE + 1))).sensor-daemon.log" 2>&1 &
-else
+# to start at all ("Failed to connect ... Connection refused"). Telling the TA
+# to pull the key still has to wait for login, below - only the daemon
+# *process* needs to be up this early.
+#
+# Note there is no secret in this shell: pair-sensor.sh writes the file and the
+# daemon reads it, so the key never enters this script's memory, its
+# environment, or the guest's command line.
+"$ROOT_DIR/scripts/pair-sensor.sh" "$SENSOR_SECRET_FILE"
+if [[ ! -x "$SENSOR_DAEMON_BIN" ]]; then
   echo "sensor_daemon not built at $SENSOR_DAEMON_BIN - run scripts/build-project.sh" >&2
   exit 1
 fi
+
+# Kill a leftover daemon from a previous run first. SO_REUSEADDR does NOT let
+# two processes listen on one port, so a survivor would keep it, the new daemon
+# would die of EADDRINUSE unnoticed (backgrounded, nothing checks its exit), and
+# QEMU would silently talk to the OLD process - whose one-shot secret latch is
+# already spent, leaving the device unable to pair with no obvious cause. A
+# no-op in the default Docker path, where --rm gives every launch a fresh one.
+if [[ -f "$SENSOR_DAEMON_PIDFILE" ]]; then
+  _stale_pid="$(cat "$SENSOR_DAEMON_PIDFILE")"
+  # Confirm the pid really is a sensor_daemon before signalling it. The pidfile
+  # outlives the process that wrote it, and in the Docker path it was recorded
+  # in a since-dead container's pid namespace, so the number alone could now
+  # belong to something entirely unrelated.
+  if [[ "$_stale_pid" =~ ^[0-9]+$ ]] &&
+     tr '\0' ' ' < "/proc/$_stale_pid/cmdline" 2>/dev/null | grep -q sensor_daemon; then
+    echo "run-project: stopping leftover sensor_daemon (pid $_stale_pid)" >&2
+    kill "$_stale_pid" 2>/dev/null || true
+    sleep 1
+  fi
+  unset _stale_pid
+fi
+
+: >"$SENSOR_DAEMON_LOG"
+"$SENSOR_DAEMON_BIN" --port "$QEMU_SENSOR_PORT" --secret "$SENSOR_SECRET_FILE" \
+  >"$SENSOR_DAEMON_LOG" 2>&1 &
+echo $! >"$SENSOR_DAEMON_PIDFILE"
+
+# Confirm it actually bound. Without this a bind failure is completely silent
+# and only surfaces much later as QEMU's "Connection refused".
+for _ in $(seq 1 10); do
+  grep -q "listening" "$SENSOR_DAEMON_LOG" 2>/dev/null && break
+  if ! kill -0 "$(cat "$SENSOR_DAEMON_PIDFILE")" 2>/dev/null; then
+    echo "sensor_daemon died on startup - see $SENSOR_DAEMON_LOG" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 tmux new-session -d -s "$QEMU_TMUX_SESSION" -n qemu \
   "cd '$OPTEE_WORKSPACE/build' && make run-only NcCns=1 QEMU_EXTRA_ARGS='$QEMU_EXTRA_ARGS' QEMU_NW_PORT=$QEMU_NW_PORT QEMU_SW_PORT=$QEMU_SW_PORT QEMU_GDB_PORT=$QEMU_GDB_PORT QEMU_SENSOR_PORT=$QEMU_SENSOR_PORT; printf '\nQEMU exited. Press Enter to close this pane.'; read -r _"
@@ -245,14 +288,18 @@ tmux new-session -d -s "$QEMU_TMUX_SESSION" -n qemu \
   tmux display-message -t "$QEMU_TMUX_SESSION" \
     "Provisioned $DEVICE_ID - see the enrollment record above to submit via POST /api/devices/register"
 
-  # Push the Sensor Module's pre-shared secret (generated/reused and already
-  # serving over sensor_daemon before QEMU even started, see above) into the
-  # TA's secure storage over the guest console - no shared filesystem with
-  # the host exists, so the base64 secret travels as a command-line argument
-  # (see main.c's --provision-sensor-secret mode). Idempotent on the TA side,
-  # so re-running this is harmless if the secret was already provisioned.
+  # Tell the TA to pull the Sensor Module's pre-shared secret and seal it.
+  # Nothing is pushed in: the command takes no argument, and the key crosses
+  # the secure UART2 that Normal World cannot address (see main.c's
+  # --provision-sensor-secret mode and ta_provision_sensor_secret). Idempotent
+  # on the TA side, so re-running this on a paired device is a no-op that puts
+  # nothing on the link.
+  #
+  # The edge binary repeats this at startup, so this step is not load-bearing -
+  # it is here to fail fast and legibly in a process that does nothing else,
+  # and to keep pairing an observable milestone, before the run below.
   tmux send-keys -t "$QEMU_TMUX_SESSION:1.0" \
-    "$PROJECT_EDGE_BINARY --provision-sensor-secret '$SENSOR_SECRET_B64'; echo CIOT_PAIR_DONE=\$?" C-m 2>/dev/null || true
+    "$PROJECT_EDGE_BINARY --provision-sensor-secret; echo CIOT_PAIR_DONE=\$?" C-m 2>/dev/null || true
 
   if ! wait_for_pane_text "$QEMU_TMUX_SESSION:1.0" "CIOT_PAIR_DONE=" "$QEMU_PROVISION_TIMEOUT"; then
     tmux display-message -t "$QEMU_TMUX_SESSION" \

@@ -19,6 +19,14 @@
 # ephemeral initrd) - so on a build with the persistent /var/lib/tee disk, a
 # reboot just reprints the existing record instead of minting a new AK.
 #
+# Sensor Module pairing is a SEPARATE step, deliberately not done here: this
+# script is `set -e` and is retried in a loop by scripts/run-project.sh until
+# the fTPM settles, so a sensor-link failure must not abort AK provisioning for
+# an unrelated reason. Pairing is driven by `$EDGE_BIN
+# --provision-sensor-secret` (run-project.sh, and again by the edge binary at
+# startup). It passes no secret either: the TA pulls the key from the sensor
+# over the secure UART.
+#
 # NOTE: exact tpm2-tools flags below should be checked against
 # `tpm2_createek --help` / `tpm2_createak --help` / `tpm2_readpublic --help`
 # on the real target image (tpm2-tools 5.7) - this could not be executed

@@ -1143,42 +1143,93 @@ out:
 
 /*
  * One-time provisioning of the Sensor Module's pre-shared secret into this
- * TA's secure storage. Never compiled into source - see
- * TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET's doc comment in
- * confidential_iot_ta.h. Idempotent: TEE_CreatePersistentObject without
- * TEE_DATA_FLAG_OVERWRITE fails with TEE_ERROR_ACCESS_CONFLICT if a secret
- * is already stored, which this treats as an expected "already provisioned"
- * outcome rather than an error, mirroring provision-device.sh's AK-exists
- * gate.
+ * TA's secure storage - see TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET's
+ * doc comment in confidential_iot_ta.h.
+ *
+ * The secret is PULLED from the Sensor Module over the sensor_link PTA's
+ * secure UART2 rather than handed in by the Host. That is the entire point of
+ * the command's parameter shape: it takes nothing, so there is no slot through
+ * which a compromised Normal World could either learn the secret or inject one
+ * of its own and pair this device to a sensor it controls.
  */
-TEE_Result ta_provision_sensor_secret(struct confidential_iot_session __unused *sess,
-				      uint32_t param_types, TEE_Param params[4])
+TEE_Result ta_provision_sensor_secret(struct confidential_iot_session *sess,
+				      uint32_t param_types,
+				      TEE_Param __unused params[4])
 {
-	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_INPUT,
+	const uint32_t exp_pt = TEE_PARAM_TYPES(TEE_PARAM_TYPE_NONE,
 						 TEE_PARAM_TYPE_NONE,
 						 TEE_PARAM_TYPE_NONE,
 						 TEE_PARAM_TYPE_NONE);
 	TEE_ObjectHandle obj = TEE_HANDLE_NULL;
 	TEE_Result res;
+	uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE];
+	TEE_Param sensor_params[TEE_NUM_PARAMS];
+	uint32_t err_origin;
 
 	if (param_types != exp_pt)
 		return TEE_ERROR_BAD_PARAMETERS;
-	if (params[0].memref.size != TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE)
-		return TEE_ERROR_BAD_PARAMETERS;
 
-	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE, "ciot.sensor.psk",
-					 strlen("ciot.sensor.psk"),
-					 TEE_DATA_FLAG_ACCESS_WRITE,
-					 TEE_HANDLE_NULL,
-					 params[0].memref.buffer,
-					 params[0].memref.size, &obj);
-	if (res == TEE_ERROR_ACCESS_CONFLICT)
+	/*
+	 * Short-circuit before touching the link. This is a correctness
+	 * requirement, not an optimisation: the Sensor Module serves its secret
+	 * at most once per power-on, so a device that already holds the secret
+	 * must not spend that one chance re-fetching a value it has. It also
+	 * makes the command safely re-runnable by anyone, including a hostile
+	 * Host - after the first success it emits no wire traffic at all.
+	 */
+	res = TEE_OpenPersistentObject(TEE_STORAGE_PRIVATE, "ciot.sensor.psk",
+					strlen("ciot.sensor.psk"),
+					TEE_DATA_FLAG_ACCESS_READ, &obj);
+	if (res == TEE_SUCCESS) {
+		TEE_CloseObject(obj);
 		return TEE_SUCCESS; /* already provisioned, idempotent no-op */
+	}
+	if (res != TEE_ERROR_ITEM_NOT_FOUND)
+		return res;
+
+	res = open_sensor_pta(sess);
 	if (res != TEE_SUCCESS)
 		return res;
 
+	TEE_MemFill(sensor_params, 0, sizeof(sensor_params));
+	sensor_params[0].memref.buffer = secret;
+	sensor_params[0].memref.size = sizeof(secret);
+
+	res = TEE_InvokeTACommand(sess->sensor_pta_sess, TEE_TIMEOUT_INFINITE,
+				   PTA_SENSOR_LINK_CMD_FETCH_SECRET,
+				   TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+						   TEE_PARAM_TYPE_NONE,
+						   TEE_PARAM_TYPE_NONE,
+						   TEE_PARAM_TYPE_NONE),
+				   sensor_params, &err_origin);
+	if (res != TEE_SUCCESS)
+		goto out_wipe_secret;
+	if (sensor_params[0].memref.size != sizeof(secret)) {
+		res = TEE_ERROR_COMMUNICATION;
+		goto out_wipe_secret;
+	}
+
+	/* First-write-wins, matching ciot.ta.identity and ciot.server.pubkey:
+	 * no TEE_DATA_FLAG_OVERWRITE, so the stored secret is immutable once
+	 * sealed. ACCESS_CONFLICT here means a concurrent session won the race
+	 * between the probe above and this create, storing the same value. */
+	res = TEE_CreatePersistentObject(TEE_STORAGE_PRIVATE, "ciot.sensor.psk",
+					 strlen("ciot.sensor.psk"),
+					 TEE_DATA_FLAG_ACCESS_WRITE,
+					 TEE_HANDLE_NULL, secret,
+					 sizeof(secret), &obj);
+	if (res == TEE_ERROR_ACCESS_CONFLICT) {
+		res = TEE_SUCCESS;
+		goto out_wipe_secret;
+	}
+	if (res != TEE_SUCCESS)
+		goto out_wipe_secret;
+
 	TEE_CloseObject(obj);
-	return TEE_SUCCESS;
+
+out_wipe_secret:
+	TEE_MemFill(secret, 0, sizeof(secret));
+	return res;
 }
 
 TEE_Result TA_InvokeCommandEntryPoint(void *sess_ctx, uint32_t cmd_id,

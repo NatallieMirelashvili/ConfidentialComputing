@@ -16,6 +16,11 @@
  * leaves Secure World (see core/kernel/pseudo_ta.c's
  * tee_ta_init_pseudo_ta_session()) - so sensor bytes never transit a
  * Host-owned buffer.
+ *
+ * That property is also why the sensor's pre-shared key is PULLED across this
+ * link (PTA_SENSOR_LINK_CMD_FETCH_SECRET) rather than pushed in from the
+ * Normal World: the key reaches the TA over a path the Host cannot address,
+ * so provisioning never exposes it to a compromised guest.
  */
 
 #include <assert.h>
@@ -28,6 +33,7 @@
 #include <mm/core_mmu.h>
 #include <pta_sensor_link.h>
 #include <string.h>
+#include <string_ext.h>
 #include <trace.h>
 
 #define PTA_NAME "sensor_link.pta"
@@ -119,12 +125,19 @@ static void write_frame(uint8_t type, const uint8_t *payload, uint16_t len)
 }
 
 /*
- * Reads one framed message whose type must be @want_type. @payload must be
- * at least SENSOR_LINK_READING_MAX bytes (the largest payload this protocol
- * ever carries). Returns the payload length via *out_len, or false on
- * timeout / a frame whose type doesn't match / an oversized length field.
+ * Reads one framed message whose type must be @want_type into @payload,
+ * writing at most @payload_size bytes. Returns the payload length via
+ * *out_len, or false on timeout / a frame whose type doesn't match / a length
+ * field that is oversized or would not fit @payload.
+ *
+ * @payload_size is not optional bookkeeping: the length field is supplied by
+ * the Sensor Module, which is exactly the party the challenge-response exists
+ * to distrust, so it must never be allowed to decide how much this writes.
+ * Bounding on the caller's actual buffer is what keeps a lying sensor from
+ * overrunning a TA stack buffer.
  */
-static bool read_frame(uint8_t want_type, uint8_t *payload, size_t *out_len)
+static bool read_frame(uint8_t want_type, uint8_t *payload, size_t payload_size,
+		        size_t *out_len)
 {
 	uint8_t hdr[SENSOR_LINK_FRAME_HDR_SIZE];
 	uint16_t len;
@@ -134,7 +147,7 @@ static bool read_frame(uint8_t want_type, uint8_t *payload, size_t *out_len)
 	if (hdr[0] != want_type)
 		return false;
 	len = ((uint16_t)hdr[1] << 8) | hdr[2];
-	if (len > SENSOR_LINK_READING_MAX)
+	if (len > SENSOR_LINK_READING_MAX || len > payload_size)
 		return false;
 	if (len && !uart_read(payload, len))
 		return false;
@@ -165,7 +178,8 @@ static TEE_Result sensor_link_challenge(uint32_t types,
 		    SENSOR_LINK_CHALLENGE_SIZE);
 
 	if (!read_frame(SENSOR_LINK_FRAME_CHALLENGE_RESPONSE,
-			 params[1].memref.buffer, &resp_len)) {
+			 params[1].memref.buffer, params[1].memref.size,
+			 &resp_len)) {
 		DMSG(PTA_NAME" CHALLENGE: no/bad response from sensor");
 		return TEE_ERROR_COMMUNICATION;
 	}
@@ -194,13 +208,77 @@ static TEE_Result sensor_link_read(uint32_t types,
 	sensor_uart_ensure_init();
 
 	if (!read_frame(SENSOR_LINK_FRAME_READING, params[0].memref.buffer,
-			 &len)) {
+			 params[0].memref.size, &len)) {
 		DMSG(PTA_NAME" READ: no/bad reading from sensor");
 		return TEE_ERROR_COMMUNICATION;
 	}
 
 	params[0].memref.size = len;
 	return TEE_SUCCESS;
+}
+
+/*
+ * Pull the Sensor Module's burned-in pre-shared key so the TA can seal it.
+ *
+ * This is the one command that carries key material, and it is safe here for
+ * the reason the whole PTA exists: UART2 is unreachable from Normal World, so
+ * the key never touches a Host-owned buffer. The alternative it replaces -
+ * handing the key to the Host CA as a base64 argument and letting it push the
+ * bytes in - exposed the plaintext to anything running on the guest.
+ */
+static TEE_Result sensor_link_fetch_secret(uint32_t types,
+					    TEE_Param params[TEE_NUM_PARAMS])
+{
+	/*
+	 * Bounce buffer rather than reading straight into the caller's memref:
+	 * the caller's buffer is only written on full success, and this one can
+	 * be wiped unconditionally on the way out so the key does not linger in
+	 * a stale stack frame.
+	 */
+	uint8_t buf[SENSOR_LINK_SECRET_SIZE];
+	size_t len = 0;
+	TEE_Result res = TEE_SUCCESS;
+
+	if (types != TEE_PARAM_TYPES(TEE_PARAM_TYPE_MEMREF_OUTPUT,
+				      TEE_PARAM_TYPE_NONE,
+				      TEE_PARAM_TYPE_NONE,
+				      TEE_PARAM_TYPE_NONE)) {
+		DMSG(PTA_NAME" FETCH_SECRET: bad param types 0x%"PRIx32, types);
+		return TEE_ERROR_BAD_PARAMETERS;
+	}
+	if (params[0].memref.size < SENSOR_LINK_SECRET_SIZE)
+		return TEE_ERROR_SHORT_BUFFER;
+
+	sensor_uart_ensure_init();
+
+	write_frame(SENSOR_LINK_FRAME_SECRET_REQUEST, NULL, 0);
+
+	if (!read_frame(SENSOR_LINK_FRAME_SECRET, buf, sizeof(buf), &len)) {
+		DMSG(PTA_NAME" FETCH_SECRET: no/bad SECRET frame from sensor");
+		res = TEE_ERROR_COMMUNICATION;
+		goto out;
+	}
+	if (!len) {
+		/* Documented refusal encoding - the sensor's one-shot latch is
+		 * spent. Distinct from COMMUNICATION so the operator reads
+		 * "the sensor said no" rather than "the link is dead"; the
+		 * remedy is to restart sensor_daemon. */
+		DMSG(PTA_NAME" FETCH_SECRET: sensor refused (already served)");
+		res = TEE_ERROR_ACCESS_DENIED;
+		goto out;
+	}
+	if (len != SENSOR_LINK_SECRET_SIZE) {
+		DMSG(PTA_NAME" FETCH_SECRET: bad secret length %zu", len);
+		res = TEE_ERROR_COMMUNICATION;
+		goto out;
+	}
+
+	memcpy(params[0].memref.buffer, buf, SENSOR_LINK_SECRET_SIZE);
+	params[0].memref.size = SENSOR_LINK_SECRET_SIZE;
+
+out:
+	memzero_explicit(buf, sizeof(buf));
+	return res;
 }
 
 /*
@@ -237,6 +315,8 @@ static TEE_Result invoke_command(void *sess_ctx __unused, uint32_t cmd_id,
 		return sensor_link_challenge(param_types, params);
 	case PTA_SENSOR_LINK_CMD_READ:
 		return sensor_link_read(param_types, params);
+	case PTA_SENSOR_LINK_CMD_FETCH_SECRET:
+		return sensor_link_fetch_secret(param_types, params);
 	default:
 		return TEE_ERROR_NOT_IMPLEMENTED;
 	}
