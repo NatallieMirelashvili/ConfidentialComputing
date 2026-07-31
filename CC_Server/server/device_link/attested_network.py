@@ -12,7 +12,8 @@ Wire protocol (newline-delimited JSON, one persistent TCP connection):
                           "server_identity_pub": "<b64>"}
     device -> server    {"type": "attest_response", "device_id": "...",
                           "device_ecdh_pub": "<b64>", "quote": "<b64>",
-                          "signature": "<b64>", "pcr_values": "<text>"}
+                          "signature": "<b64>", "pcr_values": "<text>",
+                          "ta_sig": "<b64>"}
     server -> device    {"type": "attest_result", "ok": true|false,
                           "session_ttl"?: <int>, "server_sig"?: "<b64>",
                           "error"?: "..."}
@@ -21,6 +22,15 @@ Wire protocol (newline-delimited JSON, one persistent TCP connection):
 let the device authenticate the SERVER: it pins server_identity_pub on first
 use and thereafter requires server_sig to verify under the pinned key before
 trusting the session - see docs/HANDOFF_serverAuthentication.md.
+
+`ta_sig` (raw 64-byte r||s) is the mirror image, letting the SERVER authenticate
+the TA. The genuine TA signs SHA-256("CC-IOT-1 ta-identity" || nonce ||
+server_ecdh_pub || device_ecdh_pub || device_id) with an ECDSA P-256 key
+generated inside the TEE, sealed in OP-TEE secure storage and pinned at
+registration. Without it the quote proves only the device and its firmware: the
+AK belongs to the fTPM and this very message is assembled by the untrusted Host,
+so root could bypass the TA entirely and still present a valid quote over a key
+it controls - see docs/HANDOFF_taIdentityBinding.md.
     device -> server    {"type": "data", "device_id": "...", "seq": <int>,
                           "nonce": "<b64>", "ciphertext": "<b64>"}
                           (repeatable, AEAD-wrapped JSON {"samples": [...]};
@@ -114,6 +124,12 @@ class AttestedNetworkDeviceLink(DeviceLink):
                             quote_b64=msg["quote"],
                             signature_b64=msg["signature"],
                             pcr_values_text=msg["pcr_values"],
+                            # Subscript, not .get(): a missing ta_sig raises
+                            # KeyError, which the handler below already turns
+                            # into attest_result{ok:false}. Fail-closed by
+                            # construction - a Host that skips the TA cannot
+                            # simply omit the field to skip the check.
+                            ta_sig_b64=msg["ta_sig"],
                         )
                     except (AttestationError, KeyError) as exc:
                         _logger.warning(

@@ -41,10 +41,28 @@
 #define SENSOR_LINK_FRAME_CHALLENGE		0x01 /* device -> sensor */
 #define SENSOR_LINK_FRAME_CHALLENGE_RESPONSE	0x02 /* sensor -> device */
 #define SENSOR_LINK_FRAME_READING		0x03 /* sensor -> device */
+/*
+ * Pre-shared key delivery, used once in a device's life. SECRET_REQUEST
+ * carries an empty payload; the Sensor Module answers with SECRET, whose
+ * payload is either SENSOR_LINK_SECRET_SIZE bytes (the key) or ZERO bytes,
+ * which means "refused - I have already served it once".
+ *
+ * The refusal is an explicit empty frame rather than silence on purpose: the
+ * caller fails immediately with a specific error instead of stalling for the
+ * full read timeout, and the byte stream stays framed so the CHALLENGE and
+ * READING traffic that follows is unaffected.
+ */
+#define SENSOR_LINK_FRAME_SECRET_REQUEST	0x04 /* device -> sensor */
+#define SENSOR_LINK_FRAME_SECRET		0x05 /* sensor -> device */
 #define SENSOR_LINK_FRAME_HDR_SIZE		3
 
 #define SENSOR_LINK_CHALLENGE_SIZE	32
 #define SENSOR_LINK_HMAC_SIZE		32
+/* The Sensor Module's burned-in pre-shared key, pulled across this link by
+ * PTA_SENSOR_LINK_CMD_FETCH_SECRET. Must equal both
+ * TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE in confidential_iot_ta.h and
+ * SENSOR_LINK_SECRET_SIZE in sensor_module/sensor_link_proto.h. */
+#define SENSOR_LINK_SECRET_SIZE	32
 #define SENSOR_LINK_READING_MAX	256
 
 /*
@@ -96,5 +114,41 @@
  * TEE_ERROR_SHORT_BUFFER - reading larger than the caller's buffer
  */
 #define PTA_SENSOR_LINK_CMD_READ	1
+
+/*
+ * PTA_SENSOR_LINK_CMD_FETCH_SECRET - pull the Sensor Module's burned-in
+ * pre-shared key across the secure UART, so the TA can seal it without the
+ * Normal World ever holding it.
+ *
+ * This is the whole point of routing the key this way: UART2 is unreachable
+ * from Normal World (see the file header above), so the key travels a path the
+ * Host cannot address. The Host CA only triggers the TA command that calls
+ * this; it passes nothing and receives nothing but a result code.
+ *
+ * Access control is inherited, not re-implemented: open_session() in
+ * sensor_link.c already refuses every caller except the confidential_iot TA,
+ * for the whole session, so no per-command check is needed here.
+ *
+ * [out] memref[0] - buffer >= SENSOR_LINK_SECRET_SIZE bytes; filled with the
+ *                    sensor's key and its size set to SENSOR_LINK_SECRET_SIZE
+ *                    on success
+ * param[1..3] unused
+ *
+ * ORDERING: must be invoked before the first PTA_SENSOR_LINK_CMD_CHALLENGE of
+ * a device generation. The Sensor Module starts pushing unsolicited READING
+ * frames once a challenge has succeeded; after that a SECRET read would
+ * consume a queued READING, fail the type check, and desync the stream.
+ *
+ * Result:
+ * TEE_SUCCESS - key received and copied out
+ * TEE_ERROR_BAD_PARAMETERS - bad param shapes
+ * TEE_ERROR_SHORT_BUFFER - memref[0] smaller than SENSOR_LINK_SECRET_SIZE
+ * TEE_ERROR_ACCESS_DENIED - the sensor refused: it serves its key at most once
+ *                           per power-on and has already done so. Recover by
+ *                           restarting sensor_daemon.
+ * TEE_ERROR_COMMUNICATION - no reply within the read timeout, wrong frame
+ *                           type, or a reply of the wrong length
+ */
+#define PTA_SENSOR_LINK_CMD_FETCH_SECRET	2
 
 #endif /* __PTA_SENSOR_LINK_H */

@@ -5,6 +5,14 @@
 *.swp
 *.swo
 
+# Development notes and course material under docs/ - kept on the local machine,
+# deliberately not in Git. What docs/ carries in the repository is the published
+# documentation and the Wireshark demo capture (docs/demo/).
+# To publish a document later, force-add it once: git add -f docs/<file>
+docs/*.md
+docs/*.pdf
+docs/verify/
+
 # CC_Server
 CC_Server/.pytest_cache/
 CC_Server/**/__pycache__/

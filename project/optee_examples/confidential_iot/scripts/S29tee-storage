@@ -1,9 +1,9 @@
 #!/bin/sh
-# Mount the persistent virtio-blk disk (attached by scripts/run-project.sh,
-# see docs/HANDOFF_persistentAK.md) at /var/lib/tee, before /etc/init.d/S30optee
-# starts tee-supplicant. Without this, OP-TEE's REE-FS secure storage - including
-# the fTPM's persisted Attestation Key at handle 0x8101000A - lives on the
-# ephemeral initrd and is wiped every reboot.
+# Mount the persistent virtio-blk disk (attached by scripts/run-project.sh) at
+# /var/lib/tee, before /etc/init.d/S30optee starts tee-supplicant. Without this,
+# OP-TEE's REE-FS secure storage - including the fTPM's persisted Attestation
+# Key at handle 0x8101000A - lives on the ephemeral initrd and is wiped every
+# reboot.
 #
 # Runs before S30optee: the S## prefix controls init ordering (this is S29).
 #

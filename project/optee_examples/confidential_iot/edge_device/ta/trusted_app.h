@@ -16,12 +16,11 @@
  *
  * sensor_authenticated records whether the attached Sensor Module has proven
  * its identity to this device via a real HMAC-SHA256 challenge-response
- * (ta_authenticate_sensor, run over the sensor_link PTA's secure UART2 -
- * see docs/ARCHITECTURE.md). It is a precondition, enforced inside the TA,
- * for ta_read_and_protect. Keeping the verdict here (rather than trusting
- * the Host to have run the check) is what stops a tampered Host CA from
- * simply skipping sensor authentication: the data-handling command refuses
- * to run while this is false.
+ * (ta_authenticate_sensor, run over the sensor_link PTA's secure UART2). It is
+ * a precondition, enforced inside the TA, for ta_read_and_protect. Keeping the
+ * verdict here (rather than trusting the Host to have run the check) is what
+ * stops a tampered Host CA from simply skipping sensor authentication: the
+ * data-handling command refuses to run while this is false.
  *
  * send_seq is a per-session monotonically increasing message counter used for
  * inner-session anti-replay: ta_read_and_protect increments it for every
@@ -64,5 +63,7 @@ TEE_Result ta_generate_attestation_evidence(struct confidential_iot_session *ses
 					    TEE_Param params[4]);
 TEE_Result ta_handshake_complete(struct confidential_iot_session *sess,
 				 uint32_t param_types, TEE_Param params[4]);
+TEE_Result ta_generate_ta_identity(struct confidential_iot_session *sess,
+				   uint32_t param_types, TEE_Param params[4]);
 
 #endif /* TRUSTED_APP_H */

@@ -13,16 +13,6 @@ async function apiGet(path) {
   return (await fetch(path)).json();
 }
 
-async function apiPost(path, obj) {
-  return (
-    await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(obj),
-    })
-  ).json();
-}
-
 // --- UI --------------------------------------------------------------------
 const $ = (id) => document.getElementById(id);
 
@@ -47,31 +37,10 @@ async function init() {
     sel.appendChild(o);
   });
 
-  $("collect").addEventListener("click", onCollect);
   $("device").addEventListener("change", applyLiveParams);
   $("window").addEventListener("change", applyLiveParams);
   $("aggregation").addEventListener("change", applyLiveParams);
   openLiveSocket();
-}
-
-async function onCollect() {
-  const btn = $("collect");
-  btn.disabled = true;
-  $("status").textContent = "collecting…";
-  try {
-    const body = {
-      device_id: $("device").value,
-      window: $("window").value,
-      aggregation: $("aggregation").value,
-    };
-    const r = await apiPost("/api/collect", body);
-    renderResult(r);
-    $("status").textContent = "done";
-  } catch (e) {
-    $("status").textContent = "error: " + e;
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 function chip(label, ok) {

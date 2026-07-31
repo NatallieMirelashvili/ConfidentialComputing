@@ -21,6 +21,10 @@
 #define CIOT_ECDH_PUB_SIZE	TA_CONFIDENTIAL_IOT_ECDH_PUBKEY_SIZE
 #define CIOT_TRANSCRIPT_HASH_SIZE TA_CONFIDENTIAL_IOT_TRANSCRIPT_HASH_SIZE
 #define CIOT_SERVER_SIG_SIZE	TA_CONFIDENTIAL_IOT_SERVER_SIG_SIZE
+#define CIOT_TA_SIG_SIZE	TA_CONFIDENTIAL_IOT_TA_SIG_SIZE
+/* CMD 3 returns transcript_hash(32) || ta_sig(64) in one buffer - the GP API
+ * allows only four params and all four are in use. See confidential_iot_ta.h. */
+#define CIOT_EVIDENCE_BLOCK_SIZE TA_CONFIDENTIAL_IOT_EVIDENCE_BLOCK_SIZE
 
 /* Local device configuration, set up once by scripts/provision-device.sh
  * and read from /etc/confidential_iot/device.conf (env vars override). */
@@ -28,7 +32,10 @@ static char g_device_id[64] = "iot-edge-01";
 static char g_server_host[64] = "127.0.0.1";
 static uint16_t g_server_port = 9000;
 static char g_ak_handle[32] = "0x8101000A";
-/* Management-server admin API port (POST /api/devices/register), distinct
+/* Unused while self-registration is disabled (see the #if 0 block below), but
+ * still parsed from device.conf so re-enabling needs no config change.
+ *
+ * Management-server admin API port (POST /api/devices/register), distinct
  * from g_server_port (the device-facing attestation port). Same host. */
 static uint16_t g_admin_port = 8000;
 
@@ -42,8 +49,7 @@ static uint8_t g_server_ecdh_pub[CIOT_ECDH_PUB_SIZE];
 /* Server-identity material for the device->server authentication (TOFU): the
  * server's identity public key (from attest_challenge) and its per-session
  * signature (from attest_result). Cached here across edge_attest_to_server()
- * and edge_handshake(), which passes both to the TA to verify + pin. See
- * docs/HANDOFF_serverAuthentication.md. */
+ * and edge_handshake(), which passes both to the TA to verify + pin. */
 static uint8_t g_server_identity_pub[CIOT_ECDH_PUB_SIZE];
 static uint8_t g_server_sig[CIOT_SERVER_SIG_SIZE];
 static int g_attested;
@@ -204,8 +210,16 @@ static int send_json_line(cJSON *msg)
 
 #ifndef CONFIDENTIAL_IOT_NATIVE
 
+/*
+ * Ask the TA for this session's ephemeral ECDH public key plus its evidence
+ * block: the transcript hash the fTPM will quote, followed by the TA's own
+ * identity signature over that same session (see
+ * TA_CONFIDENTIAL_IOT_CMD_GENERATE_ATTESTATION_EVIDENCE in
+ * confidential_iot_ta.h). The two share params[3] because the GP Internal Core
+ * API caps a command at four parameters.
+ */
 static int ta_handshake_init(uint8_t out_pub[CIOT_ECDH_PUB_SIZE],
-			     uint8_t out_hash[CIOT_TRANSCRIPT_HASH_SIZE])
+			     uint8_t out_evidence[CIOT_EVIDENCE_BLOCK_SIZE])
 {
 	TEEC_Operation op;
 	TEEC_Result res;
@@ -225,15 +239,15 @@ static int ta_handshake_init(uint8_t out_pub[CIOT_ECDH_PUB_SIZE],
 	op.params[1].tmpref.size = g_nonce_len;
 	op.params[2].tmpref.buffer = g_server_ecdh_pub;
 	op.params[2].tmpref.size = CIOT_ECDH_PUB_SIZE;
-	op.params[3].tmpref.buffer = out_hash;
-	op.params[3].tmpref.size = CIOT_TRANSCRIPT_HASH_SIZE;
+	op.params[3].tmpref.buffer = out_evidence;
+	op.params[3].tmpref.size = CIOT_EVIDENCE_BLOCK_SIZE;
 
 	res = TEEC_InvokeCommand(&g_teec_sess,
 				  TA_CONFIDENTIAL_IOT_CMD_GENERATE_ATTESTATION_EVIDENCE,
 				  &op, &err_origin);
 	if (res != TEEC_SUCCESS ||
 	    op.params[0].tmpref.size != CIOT_ECDH_PUB_SIZE ||
-	    op.params[3].tmpref.size != CIOT_TRANSCRIPT_HASH_SIZE)
+	    op.params[3].tmpref.size != CIOT_EVIDENCE_BLOCK_SIZE)
 		return -1;
 
 	return 0;
@@ -296,13 +310,15 @@ static int ta_read_and_protect_encode(char *output, size_t output_size)
 
 /*
  * One-time provisioning trigger for the Sensor Module's pre-shared secret
- * (see scripts/pair-sensor.sh and ta_provision_sensor_secret in
- * trusted_app.c). The secret transits this Normal-World buffer once, at
- * pairing time - an accepted, documented trust assumption inherent to any
- * shared-secret provisioning step on this emulated platform, distinct from
- * the ongoing sensor-data path this project's hard requirement is about.
+ * (see ta_provision_sensor_secret in trusted_app.c).
+ *
+ * No secret passes through this process. The TA pulls it from the Sensor
+ * Module over the sensor_link PTA's secure UART2, which this Normal World
+ * cannot address, so the plaintext never reaches a Host-owned buffer - not
+ * here, not in argv, not in TEEC shared memory. All this call carries is the
+ * request itself and, back, a result code.
  */
-int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+int edge_provision_sensor_secret(void)
 {
 	TEEC_Operation op;
 	TEEC_Result res;
@@ -312,10 +328,8 @@ int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR
 		return -1;
 
 	memset(&op, 0, sizeof(op));
-	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT, TEEC_NONE,
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_NONE, TEEC_NONE,
 					  TEEC_NONE, TEEC_NONE);
-	op.params[0].tmpref.buffer = (void *)secret;
-	op.params[0].tmpref.size = TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE;
 
 	res = TEEC_InvokeCommand(&g_teec_sess,
 				  TA_CONFIDENTIAL_IOT_CMD_PROVISION_SENSOR_SECRET,
@@ -323,12 +337,54 @@ int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR
 	return (res == TEEC_SUCCESS) ? 0 : -1;
 }
 
+/*
+ * One-time provisioning of the TA's own identity keypair. The TA mints it
+ * inside the TEE on first call and seals it - bound to g_device_id - returning
+ * only the 65-byte public point; later calls just re-export the same point, so
+ * this is safe to run on every boot. See
+ * TA_CONFIDENTIAL_IOT_CMD_GENERATE_TA_IDENTITY in confidential_iot_ta.h.
+ *
+ * g_device_id is deliberately not a parameter: using the same global that
+ * edge_attest_to_server() puts in attest_response guarantees the identity the
+ * TA seals is byte-identical to the one the server looks the TA key up by.
+ */
+int edge_provision_ta_identity(uint8_t out_pub[CIOT_ECDH_PUB_SIZE])
+{
+	TEEC_Operation op;
+	TEEC_Result res;
+	uint32_t err_origin;
+	size_t id_len = strlen(g_device_id);
+
+	if (!g_teec_open)
+		return -1;
+	if (id_len == 0 || id_len > TA_CONFIDENTIAL_IOT_DEVICE_ID_MAX)
+		return -1;
+
+	memset(&op, 0, sizeof(op));
+	op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
+					  TEEC_MEMREF_TEMP_OUTPUT,
+					  TEEC_NONE, TEEC_NONE);
+	op.params[0].tmpref.buffer = g_device_id;
+	op.params[0].tmpref.size = id_len;
+	op.params[1].tmpref.buffer = out_pub;
+	op.params[1].tmpref.size = CIOT_ECDH_PUB_SIZE;
+
+	res = TEEC_InvokeCommand(&g_teec_sess,
+				  TA_CONFIDENTIAL_IOT_CMD_GENERATE_TA_IDENTITY,
+				  &op, &err_origin);
+	if (res != TEEC_SUCCESS ||
+	    op.params[1].tmpref.size != CIOT_ECDH_PUB_SIZE)
+		return -1;
+
+	return 0;
+}
+
 #else /* CONFIDENTIAL_IOT_NATIVE: no TEE client library available to link */
 
 static int ta_handshake_init(uint8_t out_pub[CIOT_ECDH_PUB_SIZE],
-			     uint8_t out_hash[CIOT_TRANSCRIPT_HASH_SIZE])
+			     uint8_t out_evidence[CIOT_EVIDENCE_BLOCK_SIZE])
 {
-	(void)out_pub; (void)out_hash;
+	(void)out_pub; (void)out_evidence;
 	return -1;
 }
 
@@ -338,9 +394,14 @@ static int ta_read_and_protect_encode(char *output, size_t output_size)
 	return -1;
 }
 
-int edge_provision_sensor_secret(const uint8_t secret[TA_CONFIDENTIAL_IOT_SENSOR_SECRET_SIZE])
+int edge_provision_sensor_secret(void)
 {
-	(void)secret;
+	return -1;
+}
+
+int edge_provision_ta_identity(uint8_t out_pub[CIOT_ECDH_PUB_SIZE])
+{
+	(void)out_pub;
 	return -1;
 }
 
@@ -366,8 +427,10 @@ int edge_attest_to_server(void)
 {
 	char line[CIOT_LINE_MAX];
 	char device_pub_b64[128];
+	char ta_sig_b64[128];
 	uint8_t device_pub[CIOT_ECDH_PUB_SIZE];
-	uint8_t transcript_hash[CIOT_TRANSCRIPT_HASH_SIZE];
+	/* transcript_hash(32) || ta_sig(64), returned as one block by CMD 3. */
+	uint8_t evidence[CIOT_EVIDENCE_BLOCK_SIZE];
 	struct attestation_evidence ev;
 	cJSON *msg;
 	const cJSON *item;
@@ -451,16 +514,27 @@ int edge_attest_to_server(void)
 	cJSON_Delete(msg);
 
 	/* The TA generates the ephemeral keypair and hands back the pubkey
-	 * together with SHA-256(nonce || server_pub || device_pub). */
-	if (ta_handshake_init(device_pub, transcript_hash) != 0)
+	 * together with SHA-256(nonce || server_pub || device_pub) and its own
+	 * identity signature over this session. */
+	if (ta_handshake_init(device_pub, evidence) != 0)
 		return -1;
 
-	if (create_attestation_report(transcript_hash, g_ak_handle, &ev) != 0)
+	/* The fTPM quotes only the transcript hash - the first 32 bytes. */
+	if (create_attestation_report(evidence, g_ak_handle, &ev) != 0)
 		return -1;
 
 	if (mbedtls_base64_encode((unsigned char *)device_pub_b64,
 				   sizeof(device_pub_b64), &olen,
 				   device_pub, CIOT_ECDH_PUB_SIZE) != 0)
+		return -1;
+
+	/* The TA identity signature rides alongside the quote; the server
+	 * verifies it against the ta_pub pinned at registration before deriving
+	 * any session key. Root cannot forge it - the key never leaves the TEE. */
+	if (mbedtls_base64_encode((unsigned char *)ta_sig_b64,
+				   sizeof(ta_sig_b64), &olen,
+				   evidence + CIOT_TRANSCRIPT_HASH_SIZE,
+				   CIOT_TA_SIG_SIZE) != 0)
 		return -1;
 
 	msg = cJSON_CreateObject();
@@ -470,7 +544,8 @@ int edge_attest_to_server(void)
 	    !cJSON_AddStringToObject(msg, "device_ecdh_pub", device_pub_b64) ||
 	    !cJSON_AddStringToObject(msg, "quote", ev.quote_b64) ||
 	    !cJSON_AddStringToObject(msg, "signature", ev.signature_b64) ||
-	    !cJSON_AddStringToObject(msg, "pcr_values", ev.pcr_values_text)) {
+	    !cJSON_AddStringToObject(msg, "pcr_values", ev.pcr_values_text) ||
+	    !cJSON_AddStringToObject(msg, "ta_sig", ta_sig_b64)) {
 		cJSON_Delete(msg);
 		return -1;
 	}
@@ -514,6 +589,21 @@ int edge_attest_to_server(void)
 	return 0;
 }
 
+/*
+ * DISABLED: device self-registration.
+ *
+ * Registration is now a deliberate operator step, done from the dev host with
+ * scripts/register-device.sh (or by POSTing /etc/confidential_iot/enrollment.json
+ * by hand). The device no longer enrols itself, so admitting a new device is an
+ * explicit decision rather than a side effect of booting it.
+ *
+ * Kept as #if 0 rather than deleted so re-enabling is a one-line change: flip
+ * this to #if 1 and restore the rc == -2 branch in edge_ensure_session() below.
+ * Note this block is the Host CA's ONLY use of system() and of curl - with it
+ * disabled the CA shells out to nothing, and the guest's curl dependency
+ * (project/buildroot/packages.conf) is only still needed if you re-enable it.
+ */
+#if 0
 #define CIOT_ENROLLMENT_PATH "/etc/confidential_iot/enrollment.json"
 #define CIOT_REGISTER_RESP_PATH "/tmp/ciot_register_resp.json"
 
@@ -574,6 +664,7 @@ static int edge_register_with_server(void)
 	cJSON_Delete(msg);
 	return 0;
 }
+#endif /* disabled self-registration */
 
 int edge_ensure_session(void)
 {
@@ -586,13 +677,22 @@ int edge_ensure_session(void)
 
 	rc = edge_attest_to_server();
 	if (rc == -2) {
+		/* Self-registration disabled (see the #if 0 block above). The
+		 * device reports and gives up for this cycle rather than
+		 * enrolling itself; main()'s loop retries, so registering it
+		 * later is picked up on the next attempt with no restart. */
 		fprintf(stderr,
-			"edge_device: not registered, attempting self-registration...\n");
-		if (edge_register_with_server() != 0)
-			return -1;
-		/* Same connection, repeat "hello" - already how device-driven
-		 * re-attestation works (see edge_attest_to_server()). */
-		rc = edge_attest_to_server();
+			"edge_device: not registered with the management server - "
+			"register it from the dev host (scripts/register-device.sh), "
+			"then this will succeed on the next retry\n");
+		return -1;
+		/*
+		 * Previous self-registration path, kept for easy revert:
+		 *
+		 * if (edge_register_with_server() != 0)
+		 *         return -1;
+		 * rc = edge_attest_to_server();
+		 */
 	}
 	if (rc != 0)
 		return -1;
@@ -629,7 +729,7 @@ int edge_handshake(void)
 		memset(&op, 0, sizeof(op));
 		/* params[2]/[3] carry the server-identity pubkey + signature so
 		 * the TA can authenticate the server (verify + TOFU-pin) before
-		 * it derives the session key - see docs/HANDOFF_serverAuthentication.md. */
+		 * it derives the session key. */
 		op.paramTypes = TEEC_PARAM_TYPES(TEEC_MEMREF_TEMP_INPUT,
 						  TEEC_MEMREF_TEMP_INPUT,
 						  TEEC_MEMREF_TEMP_INPUT,

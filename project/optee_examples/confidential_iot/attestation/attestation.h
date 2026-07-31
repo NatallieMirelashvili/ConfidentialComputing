@@ -20,12 +20,12 @@ struct attestation_evidence {
 };
 
 /*
- * Gets the fTPM (optee_ftpm, a separate TA from our own - see
- * project docs/plan for why) to quote `transcript_hash` (32-byte SHA-256 of
- * nonce || server_ecdh_pub || device_ecdh_pub) under the device's
- * provisioned Attestation Key, via the Normal World tpm2-tools stack
- * (/dev/tpmrm0). `ak_handle` is the persistent AK handle produced once by
- * the provisioning script (see scripts/provision-device.sh) - e.g. "0x8101000A".
+ * Gets the fTPM (optee_ftpm, a separate TA from our own) to quote
+ * `transcript_hash` (32-byte SHA-256 of nonce || server_ecdh_pub ||
+ * device_ecdh_pub) under the device's provisioned Attestation Key, via the
+ * Normal World tpm2-tools stack (/dev/tpmrm0). `ak_handle` is the persistent
+ * AK handle produced once by the provisioning script (see
+ * scripts/provision-device.sh) - e.g. "0x8101000A".
  *
  * Returns 0 on success (out is filled in), -1 on failure.
  *
