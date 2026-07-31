@@ -12,10 +12,9 @@ only thing that differs from its sibling `ciot_probe_ta`, which is signed normal
 and loads fine — so when test 1 shows one loading and the other refused, the
 signing key is demonstrably the reason.
 
-It models the attacker of Gap 1 in `docs/HANDOFF_taIdentityBinding.md`: root in
-Normal World, who can write anything into `/lib/optee_armtz` and sign it with a key
-of their own, but cannot sign with the project key that OP-TEE's core verifies
-against (and that is measured into PCR0).
+It models one specific attacker: root in Normal World, who can write anything into
+`/lib/optee_armtz` and sign it with a key of their own, but cannot sign with the
+project key that OP-TEE's core verifies against (and that is measured into PCR0).
 
 Test 1 uses it twice:
 

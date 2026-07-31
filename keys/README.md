@@ -13,10 +13,10 @@ the RSA public key compiled into the core. That verifier is measured into PCR0, 
 trustworthy — but with the upstream default key, an attacker with root in Normal World can
 simply **re-sign a tampered TA** and it loads cleanly.
 
-That is Gap 1 in `docs/HANDOFF_taIdentityBinding.md`. It also gates Gap 2: OP-TEE secure
-storage is scoped to the TA UUID, so without a private signing key an attacker could load a
-malicious TA carrying the *same* UUID and read the sealed `ciot.ta.identity` key that the
-TA-identity attestation leg depends on.
+That same weakness gates a second one: OP-TEE secure storage is scoped to the TA UUID, so
+without a private signing key an attacker could load a malicious TA carrying the *same*
+UUID and read the sealed `ciot.ta.identity` key that the TA-identity attestation leg
+depends on.
 
 ## How it is wired in
 
@@ -58,7 +58,9 @@ This matters because a mismatch — core baked with key X, TA signed with key Y 
   full **default-key** build. That is self-consistent and boots fine; it just silently
   lacks this protection. Build through `scripts/build.sh`.
 - Changing this key changes the OP-TEE core image, therefore **PCR0**, therefore every
-  registered device's `expected_pcr`. See `docs/RESET_DEVICE_REGISTRY.md`.
+  registered device's `expected_pcr`. Every device has to be enrolled again afterwards:
+  `scripts/reset-device-registry.sh --all`, restart the Management Server, then re-run
+  `scripts/register-device.sh` per device.
 - The private key must never reach the firmware image or the rootfs. It does not today:
   `ta.mk` copies it only into the dev-kit export directory, and the Buildroot package
   installs only `*.ta` files into the target.

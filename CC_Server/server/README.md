@@ -47,11 +47,12 @@ python -m server.main --security tls
 # open https://localhost:8000  (accept the self-signed cert once)
 ```
 
-Then in the UI: pick a device, **Last hour**, **Weighted average**, click
-**Collect** → you get the value plus the verification verdict
-(`attested / integrity / measurement`). This needs a real edge device
-(QEMU or hardware) pushing data — see `docs/ATTESTATION_TESTING.md` to run
-one end-to-end.
+Then in the UI: pick a device, a **Window** and an **Aggregation**. There is
+nothing to click to fetch data — the page streams live over a WebSocket, so the
+value appears as soon as the device pushes one, together with the verification
+verdict (`attested / integrity / measurement`). This needs a real edge device
+(QEMU or hardware) pushing data — the repository's top-level `README.md` has the
+end-to-end execution guide.
 
 ## Tests
 ```powershell
