@@ -130,7 +130,7 @@ inside one, if you happen to be there):
 scripts/build-project.sh
 ```
 
-⚠️ Note: Building the project may take 1–2 hours, depending on your system resources. 
+⚠️ Note: First building of the project may take 1–2 hours, depending on your system resources. 
 We strongly recommend running the build inside a dedicated tmux session to ensure that it continues even if your interactive terminal or SSH session is disconnected.
 
 The build also verifies that the OP-TEE core's baked-in verifier key and the
