@@ -130,6 +130,9 @@ inside one, if you happen to be there):
 scripts/build-project.sh
 ```
 
+⚠️ Note: Building the project may take 1–2 hours, depending on your system resources. 
+We strongly recommend running the build inside a dedicated tmux session to ensure that it continues even if your interactive terminal or SSH session is disconnected.
+
 The build also verifies that the OP-TEE core's baked-in verifier key and the
 built `.ta`'s signature are the same project-private key. Don't skip past that
 output — a mismatch is otherwise a *silent* build success in which every TA then
